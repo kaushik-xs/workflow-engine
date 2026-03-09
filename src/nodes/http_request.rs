@@ -29,7 +29,7 @@ impl NodeExecutor for HttpRequestExecutor {
         ctx: &ExecutionContext,
         _node_id: &str,
         mut input: Value,
-        config: Value,
+        mut config: Value,
     ) -> Result<Value, String> {
         let method = config
             .get("method")
@@ -37,15 +37,27 @@ impl NodeExecutor for HttpRequestExecutor {
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .to_uppercase();
+        expression::interpolate_value(&mut input, &ctx.context)?;
+        expression::interpolate_value(&mut config, &ctx.context)?;
+
         let url = config
             .get("url")
             .or_else(|| config.get("path"))
             .and_then(Value::as_str)
             .ok_or("HttpRequest config must have url or path")?;
 
-        expression::interpolate_value(&mut input, &ctx.context)?;
-        let body = input.get("body").cloned().unwrap_or(Value::Null);
-        let headers = input.get("headers").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+        let body = input
+            .get("body")
+            .or_else(|| config.get("body"))
+            .or_else(|| config.get("payload"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let headers = input
+            .get("headers")
+            .or_else(|| config.get("header"))
+            .or_else(|| config.get("headers"))
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
         let mut req = match method.as_str() {
             "GET" => self.client.get(url),
@@ -57,7 +69,15 @@ impl NodeExecutor for HttpRequestExecutor {
         };
 
         if body != Value::Null {
-            req = req.json(&body);
+            req = match body {
+                Value::String(s) => {
+                    req = req.header("Content-Type", "application/json");
+                    req.body(s.into_bytes())
+                }
+                _ => req.json(&body),
+            };
+        } else if matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
+            req = req.body(vec![]);
         }
         if let Some(map) = headers.as_object() {
             for (k, v) in map {
