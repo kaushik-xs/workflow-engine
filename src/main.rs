@@ -88,6 +88,7 @@ fn parse_version(v: Option<&serde_json::Value>) -> Option<i32> {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "workflow_engine=info,tower_http=info".into()),
