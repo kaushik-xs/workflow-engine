@@ -42,8 +42,11 @@ impl NodeExecutor for ServiceCallExecutor {
             .ok_or("ServiceCall config must have serviceSlug or service")?;
         let operation = config
             .get("operation")
+            .or_else(|| config.get("path"))
             .and_then(Value::as_str)
-            .ok_or("ServiceCall config must have operation")?;
+            .map(|s| s.trim_start_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or("ServiceCall config must have operation or path")?;
 
         expression::interpolate_value(&mut input, &ctx.context)?;
 
@@ -53,6 +56,6 @@ impl NodeExecutor for ServiceCallExecutor {
             .and_then(|r| r.get(service))
             .ok_or_else(|| format!("unknown service: {}", service))?;
 
-        handler.call(service, operation, input).await
+        handler.call(service, &operation, input).await
     }
 }
