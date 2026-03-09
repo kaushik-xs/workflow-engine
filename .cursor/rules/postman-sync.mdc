@@ -1,0 +1,30 @@
+---
+description: Keep Postman collection in sync when API routes or handlers change
+globs: src/main.rs,postman/**/*
+alwaysApply: false
+---
+
+# Postman collection sync
+
+When you add, change, or remove API routes or request/response behavior in this project, **update the Postman collection** so it stays in sync.
+
+## Where
+
+- **Collection file:** `postman/Workflow-Engine-API.postman_collection.json`
+- **API definition:** Routes and handlers in `src/main.rs`
+
+## What to update
+
+1. **New route** – Add a matching request in the collection (method, path, body shape, description). Use `{{base_url}}` and any collection variables (`workflow_id`, `execution_id`) where relevant.
+2. **Changed path or method** – Update the request URL and method in the collection.
+3. **Changed request/response body or status** – Update the example body and/or the test script (e.g. if a new response field should be saved to a variable).
+4. **Removed route** – Remove the corresponding request from the collection.
+5. **New or changed variable** – Add or update the `variable` array in the collection and document it in the collection description.
+
+## Collection structure
+
+- **Workflows** – Create Workflow, List Workflows, Get Workflow by ID
+- **Webhook** – Trigger by ID/name, Trigger by Name
+- **Executions** – Get Execution by ID
+
+Keep request names and descriptions clear so they match the API behavior. After editing the API, check the collection and apply the changes above.

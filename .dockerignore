@@ -1,0 +1,9 @@
+target/
+.git
+.env
+.env.*
+!.env.example
+*.md
+!README.md
+.cursor
+*.jsonl

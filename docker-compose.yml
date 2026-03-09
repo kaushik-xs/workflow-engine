@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: workflow
+      POSTGRES_PASSWORD: workflow
+      POSTGRES_DB: workflow_engine
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workflow -d workflow_engine"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  workflow-engine:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://workflow:workflow@postgres:5432/workflow_engine
+      PORT: "3000"
+      RUST_LOG: workflow_engine=info,tower_http=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

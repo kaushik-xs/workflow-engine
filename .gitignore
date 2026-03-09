@@ -1,0 +1,44 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Build and debug
+*.log
+*.tmp
+.cache/
+
+# Docker (optional local overrides)
+docker-compose.override.yml
+.docker/
+
+# Postman (local env only; collection is committed)
+postman/*.postman_environment.json
+postman/**/.*.json
+
+# SQLx offline (optional; some teams commit it)
+# .sqlx/
+
+# Misc
+*.pdb
+*.exe
