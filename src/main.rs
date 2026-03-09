@@ -11,7 +11,7 @@ use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 use workflow_engine::error::AppError;
 use workflow_engine::executor;
-use workflow_engine::registry::{DefaultNodeRegistry, DefaultServiceRegistry, NodeRegistry};
+use workflow_engine::registry::{DefaultNodeRegistry, NodeRegistry};
 use workflow_engine::storage;
 use workflow_engine::triggers;
 
@@ -104,9 +104,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let service_registry = Arc::new(DefaultServiceRegistry::new());
     let node_registry: Arc<dyn NodeRegistry> =
-        Arc::new(DefaultNodeRegistry::new(Some(service_registry)));
+        Arc::new(DefaultNodeRegistry::new(Some(Arc::new(pool.clone()))));
 
     let state = AppState {
         pool: pool.clone(),

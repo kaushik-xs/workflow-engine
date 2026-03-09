@@ -4,6 +4,16 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ServiceRegistryRow {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: Option<String>,
+    pub base_url: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Workflow {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -320,4 +330,22 @@ pub async fn list_steps_by_execution(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+pub async fn get_service_by_slug(
+    pool: &sqlx::PgPool,
+    slug: &str,
+) -> Result<Option<ServiceRegistryRow>, sqlx::Error> {
+    let row = sqlx::query_as::<_, ServiceRegistryRow>(
+        r#"
+        SELECT id, slug, name, base_url, created_at, updated_at
+        FROM service_registry
+        WHERE slug = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(slug)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
