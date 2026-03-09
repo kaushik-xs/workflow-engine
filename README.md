@@ -33,11 +33,19 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | /workflows | Create workflow (body: React Flow JSON or `{ "name", "definition" }`) |
-| GET | /workflows | List workflows |
-| GET | /workflows/:id | Get workflow by id |
-| POST | /webhook/:id | Trigger workflow by workflow UUID or by name (body/headers become Webhook context) |
-| GET | /executions/:id | Get execution by id (status, context, steps) |
+| POST | /workflows | Create workflow (body: React Flow JSON or `{ "name", "version", "definition" }`; version is a number, default `1`; new workflow is set as latest for that name) |
+| GET | /workflows | List workflows (each includes `version`, `is_latest`) |
+| GET | /workflows/:id | Get workflow by id (includes `version`, `is_latest`) |
+| PUT | /workflows/:id | Update workflow (body: `{ "definition"?, "is_latest"? }`; set `is_latest: true` to mark as latest for that name) |
+| POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
+| GET | /executions/:id | Get execution (includes `workflow_version` that was run) |
+
+## Versioning and latest
+
+- **Workflows** have a numeric `version` (1, 2, 3, …). Set it in the create body or in `definition.version`; default is `1`. Unique key is `(tenant_id, name, version)`.
+- **is_latest**: For each `(tenant_id, name)`, one workflow can be marked as latest. New workflows are created with `is_latest: true` (and others with the same name are unmarked). Use **PUT /workflows/:id** with `"is_latest": true` to mark a different version as latest.
+- **Executions** store the `workflow_version` (integer) that was run.
+- When triggering by **name** without `?version=`, the workflow with `is_latest = true` is used; with `?version=1` the specified version is used.
 
 ## Node types (initial)
 

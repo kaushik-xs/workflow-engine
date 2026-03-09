@@ -8,6 +8,8 @@ pub struct Workflow {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub name: String,
+    pub version: i32,
+    pub is_latest: bool,
     pub definition: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -17,6 +19,7 @@ pub struct Workflow {
 pub struct WorkflowExecution {
     pub id: Uuid,
     pub workflow_id: Uuid,
+    pub workflow_version: Option<i32>,
     pub status: String,
     pub context: serde_json::Value,
     pub started_at: DateTime<Utc>,
@@ -38,27 +41,74 @@ pub async fn create_workflow(
     pool: &sqlx::PgPool,
     tenant_id: Uuid,
     name: &str,
+    version: i32,
     definition: &serde_json::Value,
 ) -> Result<Workflow, sqlx::Error> {
     let row = sqlx::query_as::<_, Workflow>(
         r#"
-        INSERT INTO workflows (tenant_id, name, definition)
-        VALUES ($1, $2, $3)
-        RETURNING id, tenant_id, name, definition, created_at, updated_at
+        INSERT INTO workflows (tenant_id, name, version, definition, is_latest)
+        VALUES ($1, $2, $3, $4, true)
+        RETURNING id, tenant_id, name, version, is_latest, definition, created_at, updated_at
         "#,
     )
     .bind(tenant_id)
     .bind(name)
+    .bind(version)
     .bind(definition)
     .fetch_one(pool)
     .await?;
+    sqlx::query(
+        r#"UPDATE workflows SET is_latest = false WHERE tenant_id = $1 AND name = $2 AND id != $3"#,
+    )
+    .bind(tenant_id)
+    .bind(name)
+    .bind(row.id)
+    .execute(pool)
+    .await?;
     Ok(row)
+}
+
+pub async fn update_workflow(
+    pool: &sqlx::PgPool,
+    id: Uuid,
+    definition: Option<&serde_json::Value>,
+    is_latest: Option<bool>,
+) -> Result<Option<Workflow>, sqlx::Error> {
+    let existing = match get_workflow_by_id(pool, id).await? {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    if let Some(def) = definition {
+        sqlx::query(
+            r#"UPDATE workflows SET definition = $1, updated_at = now() WHERE id = $2"#,
+        )
+        .bind(def)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    }
+    if is_latest == Some(true) {
+        sqlx::query(
+            r#"UPDATE workflows SET is_latest = false WHERE tenant_id = $1 AND name = $2"#,
+        )
+        .bind(existing.tenant_id)
+        .bind(&existing.name)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"UPDATE workflows SET is_latest = true, updated_at = now() WHERE id = $1"#,
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
+    }
+    get_workflow_by_id(pool, id).await
 }
 
 pub async fn get_workflow_by_id(pool: &sqlx::PgPool, id: Uuid) -> Result<Option<Workflow>, sqlx::Error> {
     let row = sqlx::query_as::<_, Workflow>(
         r#"
-        SELECT id, tenant_id, name, definition, created_at, updated_at
+        SELECT id, tenant_id, name, version, is_latest, definition, created_at, updated_at
         FROM workflows WHERE id = $1
         "#,
     )
@@ -72,13 +122,41 @@ pub async fn get_workflow_by_name(
     pool: &sqlx::PgPool,
     name: &str,
     tenant_id: Option<Uuid>,
+    version: Option<i32>,
 ) -> Result<Option<Workflow>, sqlx::Error> {
-    let row = if let Some(tid) = tenant_id {
+    let row = if let Some(v) = version {
+        if let Some(tid) = tenant_id {
+            sqlx::query_as::<_, Workflow>(
+                r#"
+                SELECT id, tenant_id, name, version, is_latest, definition, created_at, updated_at
+                FROM workflows WHERE name = $1 AND tenant_id = $2 AND version = $3
+                LIMIT 1
+                "#,
+            )
+            .bind(name)
+            .bind(tid)
+            .bind(v)
+            .fetch_optional(pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, Workflow>(
+                r#"
+                SELECT id, tenant_id, name, version, is_latest, definition, created_at, updated_at
+                FROM workflows WHERE name = $1 AND version = $2
+                LIMIT 1
+                "#,
+            )
+            .bind(name)
+            .bind(v)
+            .fetch_optional(pool)
+            .await?
+        }
+    } else if let Some(tid) = tenant_id {
         sqlx::query_as::<_, Workflow>(
             r#"
-            SELECT id, tenant_id, name, definition, created_at, updated_at
+            SELECT id, tenant_id, name, version, is_latest, definition, created_at, updated_at
             FROM workflows WHERE name = $1 AND tenant_id = $2
-            ORDER BY updated_at DESC
+            ORDER BY is_latest DESC, updated_at DESC
             LIMIT 1
             "#,
         )
@@ -89,9 +167,9 @@ pub async fn get_workflow_by_name(
     } else {
         sqlx::query_as::<_, Workflow>(
             r#"
-            SELECT id, tenant_id, name, definition, created_at, updated_at
+            SELECT id, tenant_id, name, version, is_latest, definition, created_at, updated_at
             FROM workflows WHERE name = $1
-            ORDER BY updated_at DESC
+            ORDER BY is_latest DESC, updated_at DESC
             LIMIT 1
             "#,
         )
@@ -111,7 +189,7 @@ pub async fn list_workflows(
     let rows = if let Some(tid) = tenant_id {
         sqlx::query_as::<_, Workflow>(
             r#"
-            SELECT id, tenant_id, name, definition, created_at, updated_at
+            SELECT id, tenant_id, name, version, is_latest, definition, created_at, updated_at
             FROM workflows WHERE tenant_id = $1
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
@@ -125,7 +203,7 @@ pub async fn list_workflows(
     } else {
         sqlx::query_as::<_, Workflow>(
             r#"
-            SELECT id, tenant_id, name, definition, created_at, updated_at
+            SELECT id, tenant_id, name, version, is_latest, definition, created_at, updated_at
             FROM workflows
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
@@ -142,16 +220,18 @@ pub async fn list_workflows(
 pub async fn create_execution(
     pool: &sqlx::PgPool,
     workflow_id: Uuid,
+    workflow_version: Option<i32>,
     context: &serde_json::Value,
 ) -> Result<WorkflowExecution, sqlx::Error> {
     let row = sqlx::query_as::<_, WorkflowExecution>(
         r#"
-        INSERT INTO workflow_executions (workflow_id, status, context)
-        VALUES ($1, 'running', $2)
-        RETURNING id, workflow_id, status, context, started_at, finished_at
+        INSERT INTO workflow_executions (workflow_id, workflow_version, status, context)
+        VALUES ($1, $2, 'running', $3)
+        RETURNING id, workflow_id, workflow_version, status, context, started_at, finished_at
         "#,
     )
     .bind(workflow_id)
+    .bind(workflow_version)
     .bind(context)
     .fetch_one(pool)
     .await?;
@@ -187,7 +267,7 @@ pub async fn get_execution(
 ) -> Result<Option<WorkflowExecution>, sqlx::Error> {
     let row = sqlx::query_as::<_, WorkflowExecution>(
         r#"
-        SELECT id, workflow_id, status, context, started_at, finished_at
+        SELECT id, workflow_id, workflow_version, status, context, started_at, finished_at
         FROM workflow_executions WHERE id = $1
         "#,
     )

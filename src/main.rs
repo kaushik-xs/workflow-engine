@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -25,6 +25,8 @@ struct AppState {
 struct CreateWorkflowResponse {
     id: Uuid,
     name: String,
+    version: i32,
+    is_latest: bool,
     created_at: String,
 }
 
@@ -37,6 +39,8 @@ struct WorkflowListResponse {
 struct WorkflowListItem {
     id: Uuid,
     name: String,
+    version: i32,
+    is_latest: bool,
     created_at: String,
 }
 
@@ -50,6 +54,7 @@ struct WebhookResponse {
 struct ExecutionResponse {
     id: Uuid,
     workflow_id: Uuid,
+    workflow_version: Option<i32>,
     status: String,
     context: serde_json::Value,
     started_at: String,
@@ -72,6 +77,13 @@ fn tenant_from_headers(headers: &axum::http::HeaderMap) -> Option<Uuid> {
         .get(TENANT_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s.trim()).ok())
+}
+
+/// Parse version from JSON value (number or numeric string). Returns None if missing/invalid.
+fn parse_version(v: Option<&serde_json::Value>) -> Option<i32> {
+    let v = v?;
+    v.as_i64().and_then(|n| i32::try_from(n).ok())
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
 #[tokio::main]
@@ -102,7 +114,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let app = Router::new()
         .route("/workflows", post(create_workflow).get(list_workflows))
-        .route("/workflows/:id", get(get_workflow))
+        .route("/workflows/:id", get(get_workflow).put(update_workflow))
         .route("/webhook/:id", post(trigger_webhook))
         .route("/executions/:id", get(get_execution))
         .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)))
@@ -125,13 +137,14 @@ async fn create_workflow(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<CreateWorkflowResponse>), AppError> {
     let tenant_id = tenant_from_headers(&headers).unwrap_or(DEFAULT_TENANT);
-    let (name, definition) = if body.get("definition").is_some() {
+    let (name, version, definition) = if body.get("definition").is_some() {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed").to_string();
         let definition = body
             .get("definition")
             .cloned()
             .ok_or_else(|| AppError::BadRequest("definition required".into()))?;
-        (name, definition)
+        let version = parse_version(body.get("version").or(definition.get("version"))).unwrap_or(1);
+        (name, version, definition)
     } else {
         let name = body
             .get("name")
@@ -139,7 +152,8 @@ async fn create_workflow(
             .and_then(|v| v.as_str())
             .unwrap_or("unnamed")
             .to_string();
-        (name.clone(), body)
+        let version = parse_version(body.get("version")).unwrap_or(1);
+        (name.clone(), version, body)
     };
 
     if definition.get("data").and_then(|d| d.get("nodes")).is_none()
@@ -150,7 +164,7 @@ async fn create_workflow(
         ));
     }
 
-    let w = storage::create_workflow(&state.pool, tenant_id, &name, &definition)
+    let w = storage::create_workflow(&state.pool, tenant_id, &name, version, &definition)
         .await
         .map_err(AppError::from)?;
     Ok((
@@ -158,6 +172,8 @@ async fn create_workflow(
         Json(CreateWorkflowResponse {
             id: w.id,
             name: w.name,
+            version: w.version,
+            is_latest: w.is_latest,
             created_at: w.created_at.to_rfc3339(),
         }),
     ))
@@ -179,6 +195,8 @@ async fn list_workflows(
             .map(|w| WorkflowListItem {
                 id: w.id,
                 name: w.name,
+                version: w.version,
+                is_latest: w.is_latest,
                 created_at: w.created_at.to_rfc3339(),
             })
             .collect(),
@@ -203,9 +221,50 @@ async fn get_workflow(
         "id": w.id,
         "tenant_id": w.tenant_id,
         "name": w.name,
+        "version": w.version,
+        "is_latest": w.is_latest,
         "definition": w.definition,
         "created_at": w.created_at.to_rfc3339(),
         "updated_at": w.updated_at.to_rfc3339()
+    })))
+}
+
+async fn update_workflow(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let w = storage::get_workflow_by_id(&state.pool, id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
+    if let Some(tenant_id) = tenant_from_headers(&headers) {
+        if w.tenant_id != tenant_id {
+            return Err(AppError::NotFound("workflow not found".into()));
+        }
+    }
+    let definition = body.get("definition").cloned();
+    let is_latest = body.get("is_latest").and_then(|v| v.as_bool());
+    let definition_ref = definition.as_ref();
+    let updated = storage::update_workflow(
+        &state.pool,
+        id,
+        definition_ref,
+        is_latest,
+    )
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
+    Ok(Json(serde_json::json!({
+        "id": updated.id,
+        "tenant_id": updated.tenant_id,
+        "name": updated.name,
+        "version": updated.version,
+        "is_latest": updated.is_latest,
+        "definition": updated.definition,
+        "created_at": updated.created_at.to_rfc3339(),
+        "updated_at": updated.updated_at.to_rfc3339()
     })))
 }
 
@@ -214,19 +273,26 @@ struct WebhookPath {
     id: String,
 }
 
+#[derive(serde::Deserialize, Default)]
+struct WebhookQuery {
+    version: Option<i32>,
+}
+
 async fn trigger_webhook(
     State(state): State<AppState>,
     Path(WebhookPath { id: id_or_name }): Path<WebhookPath>,
+    Query(query): Query<WebhookQuery>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<WebhookResponse>, AppError> {
     let tenant_id = tenant_from_headers(&headers);
+    let version = query.version;
     let workflow = if let Ok(uuid) = Uuid::parse_str(&id_or_name) {
         storage::get_workflow_by_id(&state.pool, uuid)
             .await
             .map_err(AppError::from)?
     } else {
-        storage::get_workflow_by_name(&state.pool, &id_or_name, tenant_id)
+        storage::get_workflow_by_name(&state.pool, &id_or_name, tenant_id, version)
             .await
             .map_err(AppError::from)?
     }
@@ -238,9 +304,14 @@ async fn trigger_webhook(
     }
 
     let initial_context = triggers::webhook_context_from_request(body, &headers);
-    let exec = storage::create_execution(&state.pool, workflow.id, &initial_context)
-        .await
-        .map_err(AppError::from)?;
+    let exec = storage::create_execution(
+        &state.pool,
+        workflow.id,
+        Some(workflow.version),
+        &initial_context,
+    )
+    .await
+    .map_err(AppError::from)?;
 
     let result = executor::run_workflow(
         &state.pool,
@@ -289,6 +360,7 @@ async fn get_execution(
     Ok(Json(ExecutionResponse {
         id: exec.id,
         workflow_id: exec.workflow_id,
+        workflow_version: exec.workflow_version,
         status: exec.status,
         context: exec.context,
         started_at: exec.started_at.to_rfc3339(),

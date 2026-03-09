@@ -23,7 +23,7 @@ When you add, change, or remove API routes or request/response behavior in this 
 
 ## Collection structure
 
-- **Workflows** – Create Workflow, List Workflows, Get Workflow by ID
+- **Workflows** – Create Workflow, List Workflows, Get Workflow by ID, Update Workflow
 - **Webhook** – Trigger by ID/name, Trigger by Name
 - **Executions** – Get Execution by ID
 

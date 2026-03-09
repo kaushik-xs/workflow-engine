@@ -38,10 +38,10 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"triggerType\": \"httpTrigger\",\n  \"id\": \"sample\",\n  \"name\": \"sample\",\n  \"description\": \"This is a sample workflow\",\n  \"version\": \"1.0.0\",\n  \"data\": {\n    \"nodes\": [\n      {\n        \"id\": \"trigger-1\",\n        \"type\": \"httpTrigger\",\n        \"data\": {\n          \"method\": \"POST\",\n          \"path\": \"/trial\",\n          \"authentication\": \"bearer\"\n        }\n      },\n      {\n        \"id\": \"service-1\",\n        \"type\": \"serviceCall\",\n        \"data\": {\n          \"serviceName\": \"Authentication Service\",\n          \"operation\": \"recheck\",\n          \"serviceSlug\": \"authrs\",\n          \"method\": \"POST\",\n          \"path\": \"/api/licenses/recheck\"\n        }\n      }\n    ],\n    \"edges\": [\n      { \"source\": \"trigger-1\", \"target\": \"service-1\", \"id\": \"e1\" }\n    ]\n  }\n}"
+              "raw": "{\n  \"triggerType\": \"httpTrigger\",\n  \"id\": \"sample\",\n  \"name\": \"sample\",\n  \"description\": \"This is a sample workflow\",\n  \"version\": 1,\n  \"data\": {\n    \"nodes\": [\n      {\n        \"id\": \"trigger-1\",\n        \"type\": \"httpTrigger\",\n        \"data\": {\n          \"method\": \"POST\",\n          \"path\": \"/trial\",\n          \"authentication\": \"bearer\"\n        }\n      },\n      {\n        \"id\": \"service-1\",\n        \"type\": \"serviceCall\",\n        \"data\": {\n          \"serviceName\": \"Authentication Service\",\n          \"operation\": \"recheck\",\n          \"serviceSlug\": \"authrs\",\n          \"method\": \"POST\",\n          \"path\": \"/api/licenses/recheck\"\n        }\n      }\n    ],\n    \"edges\": [\n      { \"source\": \"trigger-1\", \"target\": \"service-1\", \"id\": \"e1\" }\n    ]\n  }\n}"
             },
             "url": "{{base_url}}/workflows",
-            "description": "Create a workflow. Optional X-Tenant-ID: workflow is created under that tenant (default tenant if omitted). Body can be full React Flow JSON or `{ \"name\", \"definition\" }`. Saves returned `id` to collection variable `workflow_id`."
+            "description": "Create a workflow. Optional `version` (number, e.g. 1); default 1. New workflow is set as latest for that name. Response includes id, name, version, is_latest, created_at. Saves `id` to `workflow_id`."
           }
         },
         {
@@ -52,7 +52,7 @@
               { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. Tenant UUID; only workflows for this tenant are returned." }
             ],
             "url": "{{base_url}}/workflows",
-            "description": "List workflows (id, name, created_at). If X-Tenant-ID is set, only that tenant's workflows are returned."
+            "description": "List workflows (id, name, version, is_latest, created_at). If X-Tenant-ID is set, only that tenant's workflows are returned."
           }
         },
         {
@@ -63,7 +63,23 @@
               { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. If set, returns 404 when workflow belongs to a different tenant." }
             ],
             "url": "{{base_url}}/workflows/{{workflow_id}}",
-            "description": "Get a single workflow including full definition. Uses variable `workflow_id`. With X-Tenant-ID, workflow must belong to that tenant."
+            "description": "Get a single workflow (id, name, version, is_latest, definition, etc.). Uses variable `workflow_id`. With X-Tenant-ID, workflow must belong to that tenant."
+          }
+        },
+        {
+          "name": "Update Workflow",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. Workflow must belong to this tenant." }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"definition\": { \"data\": { \"nodes\": [], \"edges\": [] } },\n  \"is_latest\": true\n}"
+            },
+            "url": "{{base_url}}/workflows/{{workflow_id}}",
+            "description": "Update workflow by id. Body: optional \"definition\" (full React Flow JSON), optional \"is_latest\" (true to mark this workflow as the latest for its name). At least one field should be provided."
           }
         }
       ]
@@ -99,7 +115,7 @@
               "raw": "{\n  \"hello\": \"world\",\n  \"customer_name\": \"Acme Corp\"\n}"
             },
             "url": "{{base_url}}/webhook/{{workflow_id}}",
-            "description": "Trigger workflow by workflow UUID or by name. Use {{workflow_id}} (UUID) or replace with a workflow name (e.g. 'sample'). Request body and headers become Webhook context. Saves returned `execution_id` to collection variable."
+            "description": "Trigger by UUID or name. Without ?version=, the workflow marked is_latest for that name is used; use ?version=1 to run a specific version. Saves execution_id."
           }
         },
         {
@@ -128,8 +144,8 @@
               "mode": "raw",
               "raw": "{\n  \"hello\": \"world\"\n}"
             },
-            "url": "{{base_url}}/webhook/sample",
-            "description": "Trigger workflow by name (e.g. 'sample'). With X-Tenant-ID, only workflows for that tenant are considered. If multiple workflows share the name, the most recently updated is used."
+            "url": "{{base_url}}/webhook/sample?version=1",
+            "description": "Trigger by name. Optional ?version=1; omit to use the workflow marked is_latest for that name. X-Tenant-ID scopes by tenant."
           }
         }
       ]
@@ -145,7 +161,7 @@
               { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. If set, returns 404 when the execution's workflow belongs to a different tenant." }
             ],
             "url": "{{base_url}}/executions/{{execution_id}}",
-            "description": "Get execution details: status, context, steps. Uses variable `execution_id`. With X-Tenant-ID, the execution's workflow must belong to that tenant."
+            "description": "Get execution (id, workflow_id, workflow_version, status, context, steps, etc.). Uses variable execution_id. X-Tenant-ID enforces tenant."
           }
         }
       ]
