@@ -154,6 +154,24 @@
       "name": "Executions",
       "item": [
         {
+          "name": "List Executions",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. If set, only executions for workflows belonging to this tenant are returned." }
+            ],
+            "url": {
+              "raw": "{{base_url}}/executions?workflow_id={{workflow_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["executions"],
+              "query": [
+                { "key": "workflow_id", "value": "{{workflow_id}}", "description": "Optional. Filter executions by workflow UUID." }
+              ]
+            },
+            "description": "List executions (id, workflow_id, workflow_version, status, context, started_at, finished_at). Optional query: workflow_id to filter by workflow. Optional header X-Tenant-ID to scope by tenant."
+          }
+        },
+        {
           "name": "Get Execution by ID",
           "request": {
             "method": "GET",

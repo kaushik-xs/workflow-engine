@@ -287,6 +287,82 @@ pub async fn get_execution(
     Ok(row)
 }
 
+pub async fn list_executions(
+    pool: &sqlx::PgPool,
+    workflow_id: Option<Uuid>,
+    tenant_id: Option<Uuid>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<WorkflowExecution>, sqlx::Error> {
+    let rows = match (workflow_id, tenant_id) {
+        (Some(wid), Some(tid)) => {
+            sqlx::query_as::<_, WorkflowExecution>(
+                r#"
+                SELECT e.id, e.workflow_id, e.workflow_version, e.status, e.context, e.started_at, e.finished_at
+                FROM workflow_executions e
+                INNER JOIN workflows w ON w.id = e.workflow_id AND w.tenant_id = $1
+                WHERE e.workflow_id = $2
+                ORDER BY e.started_at DESC
+                LIMIT $3 OFFSET $4
+                "#,
+            )
+            .bind(tid)
+            .bind(wid)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        (Some(wid), None) => {
+            sqlx::query_as::<_, WorkflowExecution>(
+                r#"
+                SELECT id, workflow_id, workflow_version, status, context, started_at, finished_at
+                FROM workflow_executions
+                WHERE workflow_id = $1
+                ORDER BY started_at DESC
+                LIMIT $2 OFFSET $3
+                "#,
+            )
+            .bind(wid)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, Some(tid)) => {
+            sqlx::query_as::<_, WorkflowExecution>(
+                r#"
+                SELECT e.id, e.workflow_id, e.workflow_version, e.status, e.context, e.started_at, e.finished_at
+                FROM workflow_executions e
+                INNER JOIN workflows w ON w.id = e.workflow_id AND w.tenant_id = $1
+                ORDER BY e.started_at DESC
+                LIMIT $2 OFFSET $3
+                "#,
+            )
+            .bind(tid)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query_as::<_, WorkflowExecution>(
+                r#"
+                SELECT id, workflow_id, workflow_version, status, context, started_at, finished_at
+                FROM workflow_executions
+                ORDER BY started_at DESC
+                LIMIT $1 OFFSET $2
+                "#,
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows)
+}
+
 pub async fn insert_step(
     pool: &sqlx::PgPool,
     execution_id: Uuid,

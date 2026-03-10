@@ -63,6 +63,22 @@ struct ExecutionResponse {
 }
 
 #[derive(Serialize)]
+struct ExecutionListItem {
+    id: Uuid,
+    workflow_id: Uuid,
+    workflow_version: Option<i32>,
+    status: String,
+    context: serde_json::Value,
+    started_at: String,
+    finished_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ExecutionListResponse {
+    executions: Vec<ExecutionListItem>,
+}
+
+#[derive(Serialize)]
 struct StepItem {
     node_id: String,
     status: String,
@@ -116,6 +132,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .route("/workflows", post(create_workflow).get(list_workflows))
         .route("/workflows/:id", get(get_workflow).put(update_workflow))
         .route("/webhook/:id", post(trigger_webhook))
+        .route("/executions", get(list_executions))
         .route("/executions/:id", get(get_execution))
         .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
@@ -278,6 +295,11 @@ struct WebhookQuery {
     version: Option<i32>,
 }
 
+#[derive(serde::Deserialize, Default)]
+struct ExecutionsQuery {
+    workflow_id: Option<Uuid>,
+}
+
 async fn trigger_webhook(
     State(state): State<AppState>,
     Path(WebhookPath { id: id_or_name }): Path<WebhookPath>,
@@ -331,6 +353,39 @@ async fn trigger_webhook(
     Ok(Json(WebhookResponse {
         execution_id: exec.id,
         status: status.to_string(),
+    }))
+}
+
+async fn list_executions(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<ExecutionsQuery>,
+) -> Result<Json<ExecutionListResponse>, AppError> {
+    let tenant_id = tenant_from_headers(&headers);
+    let limit = 100_i64;
+    let offset = 0_i64;
+    let rows = storage::list_executions(
+        &state.pool,
+        query.workflow_id,
+        tenant_id,
+        limit,
+        offset,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(ExecutionListResponse {
+        executions: rows
+            .into_iter()
+            .map(|e| ExecutionListItem {
+                id: e.id,
+                workflow_id: e.workflow_id,
+                workflow_version: e.workflow_version,
+                status: e.status,
+                context: e.context,
+                started_at: e.started_at.to_rfc3339(),
+                finished_at: e.finished_at.map(|t| t.to_rfc3339()),
+            })
+            .collect(),
     }))
 }
 
