@@ -1,6 +1,7 @@
 use super::{ExecutionContext, NodeExecutor};
 use async_trait::async_trait;
 use serde_json::Value;
+use tracing;
 
 use crate::expression;
 
@@ -59,6 +60,21 @@ impl NodeExecutor for HttpRequestExecutor {
             .cloned()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
+        let request = serde_json::json!({
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "body": body
+        });
+        tracing::info!(
+            execution_id = %ctx.execution_id,
+            node_type = "httpRequest",
+            method = %method,
+            url = %url,
+            "http request"
+        );
+        tracing::debug!(execution_id = %ctx.execution_id, request = ?request, "http request body");
+
         let mut req = match method.as_str() {
             "GET" => self.client.get(url),
             "POST" => self.client.post(url),
@@ -96,7 +112,8 @@ impl NodeExecutor for HttpRequestExecutor {
 
         Ok(serde_json::json!({
             "status": status,
-            "body": body_value
+            "body": body_value,
+            "request": request
         }))
     }
 }

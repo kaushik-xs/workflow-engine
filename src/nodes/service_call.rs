@@ -2,9 +2,50 @@ use super::{ExecutionContext, NodeExecutor};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
+use tracing;
 
 use crate::expression;
 use crate::storage;
+
+/// Build request log (method, url, headers, body) for steps/executions and tracing.
+fn request_log(
+    method: &str,
+    url: &str,
+    config: &Value,
+    input: &Value,
+) -> Value {
+    let body = config
+        .get("body")
+        .cloned()
+        .or_else(|| input.get("body").cloned());
+    let raw_body = config
+        .get("rawBody")
+        .or_else(|| input.get("rawBody"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    let body_for_log: Value = raw_body
+        .map(Value::String)
+        .or(body)
+        .unwrap_or(Value::Null);
+
+    let mut headers = input
+        .get("headers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    if let Some(config_headers) = config.get("headers").and_then(Value::as_object) {
+        for (k, v) in config_headers {
+            headers.insert(k.clone(), v.clone());
+        }
+    }
+
+    serde_json::json!({
+        "method": method,
+        "url": url,
+        "headers": Value::Object(headers),
+        "body": body_for_log
+    })
+}
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
@@ -49,6 +90,44 @@ impl NodeExecutor for ServiceCallExecutor {
         expression::interpolate_value(&mut input, &ctx.context)?;
         expression::interpolate_value(&mut config, &ctx.context)?;
 
+        let apply_headers_and_body = |req: reqwest::RequestBuilder, config: &Value, input: &Value| {
+            let body = config
+                .get("body")
+                .cloned()
+                .or_else(|| input.get("body").cloned());
+            let raw_body = config
+                .get("rawBody")
+                .or_else(|| input.get("rawBody"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+
+            let mut headers = input
+                .get("headers")
+                .and_then(Value::as_object)
+                .map(|m| m.clone())
+                .unwrap_or_else(serde_json::Map::new);
+            if let Some(config_headers) = config.get("headers").and_then(Value::as_object) {
+                for (k, v) in config_headers {
+                    headers.insert(k.clone(), v.clone());
+                }
+            }
+
+            let mut req = req;
+            if let Some(ref raw) = raw_body {
+                req = req.body(raw.clone());
+            } else if let Some(ref b) = body {
+                if *b != Value::Null {
+                    req = req.json(b);
+                }
+            }
+            for (k, v) in &headers {
+                if let Some(s) = v.as_str() {
+                    req = req.header(k.as_str(), s);
+                }
+            }
+            req
+        };
+
         if let Some(url_val) = config.get("url").and_then(|v| v.as_str()) {
             let method = config
                 .get("method")
@@ -56,11 +135,16 @@ impl NodeExecutor for ServiceCallExecutor {
                 .and_then(Value::as_str)
                 .unwrap_or("GET")
                 .to_uppercase();
-            let body = input.get("body").cloned().unwrap_or(Value::Null);
-            let headers = input
-                .get("headers")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+
+            let request = request_log(&method, url_val, &config, &input);
+            tracing::info!(
+                execution_id = %ctx.execution_id,
+                node_type = "serviceCall",
+                method = %method,
+                url = %url_val,
+                "service call request"
+            );
+            tracing::debug!(execution_id = %ctx.execution_id, request = ?request, "service call request body");
 
             let mut req = match method.as_str() {
                 "GET" => self.client.get(url_val),
@@ -70,17 +154,7 @@ impl NodeExecutor for ServiceCallExecutor {
                 "DELETE" => self.client.delete(url_val),
                 _ => self.client.get(url_val),
             };
-
-            if body != Value::Null {
-                req = req.json(&body);
-            }
-            if let Some(map) = headers.as_object() {
-                for (k, v) in map {
-                    if let Some(s) = v.as_str() {
-                        req = req.header(k.as_str(), s);
-                    }
-                }
-            }
+            req = apply_headers_and_body(req, &config, &input);
 
             let resp = req.send().await.map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
@@ -91,7 +165,8 @@ impl NodeExecutor for ServiceCallExecutor {
 
             return Ok(serde_json::json!({
                 "status": status,
-                "body": body_value
+                "body": body_value,
+                "request": request
             }));
         }
 
@@ -133,11 +208,16 @@ impl NodeExecutor for ServiceCallExecutor {
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .to_uppercase();
-        let body = input.get("body").cloned().unwrap_or(Value::Null);
-        let headers = input
-            .get("headers")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+
+        let request = request_log(&method, &url, &config, &input);
+        tracing::info!(
+            execution_id = %ctx.execution_id,
+            node_type = "serviceCall",
+            method = %method,
+            url = %url,
+            "service call request"
+        );
+        tracing::debug!(execution_id = %ctx.execution_id, request = ?request, "service call request body");
 
         let mut req = match method.as_str() {
             "GET" => self.client.get(&url),
@@ -147,17 +227,7 @@ impl NodeExecutor for ServiceCallExecutor {
             "DELETE" => self.client.delete(&url),
             _ => self.client.get(&url),
         };
-
-        if body != Value::Null {
-            req = req.json(&body);
-        }
-        if let Some(map) = headers.as_object() {
-            for (k, v) in map {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k.as_str(), s);
-                }
-            }
-        }
+        req = apply_headers_and_body(req, &config, &input);
 
         let resp = req.send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
@@ -168,7 +238,8 @@ impl NodeExecutor for ServiceCallExecutor {
 
         Ok(serde_json::json!({
             "status": status,
-            "body": body_value
+            "body": body_value,
+            "request": request
         }))
     }
 }
