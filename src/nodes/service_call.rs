@@ -100,14 +100,6 @@ impl NodeExecutor for ServiceCallExecutor {
             .or_else(|| config.get("service"))
             .and_then(Value::as_str)
             .ok_or("ServiceCall config must have url or (serviceSlug/service)")?;
-        let name = config
-            .get("name")
-            .or_else(|| config.get("operation"))
-            .or_else(|| config.get("path"))
-            .and_then(Value::as_str)
-            .map(|s| s.trim_matches('/').to_string())
-            .filter(|s| !s.is_empty())
-            .ok_or("ServiceCall config must have name, operation or path when not using url")?;
 
         let pool = self
             .pool
@@ -118,8 +110,21 @@ impl NodeExecutor for ServiceCallExecutor {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("unknown service: {}", slug))?;
 
+        let path_from_node = config
+            .get("path")
+            .or_else(|| config.get("operation"))
+            .or_else(|| config.get("name"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or("ServiceCall config must have path (or operation/name) when using serviceSlug")?;
+        let path = if path_from_node.starts_with('/') {
+            path_from_node
+        } else {
+            format!("/{}", path_from_node)
+        };
+
         let base = row.base_url.trim_end_matches('/');
-        let path = format!("/{}/{}", slug, name);
         let url = format!("{}{}", base, path);
 
         let method = config
