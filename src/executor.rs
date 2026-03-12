@@ -85,6 +85,23 @@ fn topological_order(node_specs: &[NodeSpec], edges: &[crate::definition::EdgeSp
     order
 }
 
+/// Ensures context has nodes, env, and current so expressions can safely reference them.
+fn ensure_context_shape(context: &mut Value) {
+    if let Some(obj) = context.as_object_mut() {
+        obj.entry("nodes")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        obj.entry("current")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        obj.entry("env").or_insert_with(|| {
+            let mut env = serde_json::Map::new();
+            for (k, v) in std::env::vars() {
+                env.insert(k, Value::String(v));
+            }
+            Value::Object(env)
+        });
+    }
+}
+
 /// Run workflow to completion (or first failure). Updates execution and steps in DB.
 pub async fn run_workflow(
     pool: &sqlx::PgPool,
@@ -103,6 +120,9 @@ pub async fn run_workflow(
     if !context.is_object() {
         context = Value::Object(serde_json::Map::new());
     }
+    ensure_context_shape(&mut context);
+
+    let mut last_output = Value::Object(serde_json::Map::new());
 
     for node_id in order {
         let node = nodes_by_id
@@ -113,15 +133,24 @@ pub async fn run_workflow(
             .ok_or_else(|| format!("unknown node type: {}", node.node_type))?;
 
         let mut exec_ctx = ExecutionContext::new(workflow_id, execution_id, context.clone());
-        exec_ctx.set_current(Value::Object(serde_json::Map::new()));
+        exec_ctx.set_current(last_output.clone());
 
         let mut input = node.input.clone();
         let mut config = node.config.clone();
         expression::interpolate_value(&mut input, &exec_ctx.context).map_err(|e| e.to_string())?;
         expression::interpolate_value(&mut config, &exec_ctx.context).map_err(|e| e.to_string())?;
 
+        tracing::info!(
+            execution_id = %execution_id,
+            node_id = %node_id,
+            node_type = %node.node_type,
+            context = %serde_json::to_string(&exec_ctx.context).unwrap_or_default(),
+            "execution context before node execution"
+        );
+
         match executor.execute(&exec_ctx, &node_id, input, config).await {
             Ok(output) => {
+                last_output = output.clone();
                 exec_ctx.set_node_output(&node_id, output.clone());
                 context = exec_ctx.context;
                 storage::update_execution(
