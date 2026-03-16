@@ -177,6 +177,22 @@ async fn run_single_node(
     }
 }
 
+/// Build merged input for a Merge node: object keyed by predecessor node id with their outputs from context.
+fn merged_predecessor_outputs(context: &Value, preds: &[String]) -> Value {
+    let empty = serde_json::Map::new();
+    let nodes = context
+        .get("nodes")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let mut map = serde_json::Map::new();
+    for p in preds {
+        if let Some(out) = nodes.get(p) {
+            map.insert(p.clone(), out.clone());
+        }
+    }
+    Value::Object(map)
+}
+
 /// Run workflow to completion (or first failure). Updates execution and steps in DB.
 pub async fn run_workflow(
     pool: &sqlx::PgPool,
@@ -190,6 +206,8 @@ pub async fn run_workflow(
     let order = topological_order(&node_specs, &edge_specs);
     let nodes_by_id: HashMap<String, &NodeSpec> =
         node_specs.iter().map(|n| (n.id.clone(), n)).collect();
+    let node_ids: HashSet<String> = node_specs.iter().map(|n| n.id.clone()).collect();
+    let pred = predecessors_by_node(&edge_specs, &node_ids);
 
     let mut context = initial_context;
     if !context.is_object() {
@@ -203,6 +221,11 @@ pub async fn run_workflow(
         let node = nodes_by_id
             .get(&node_id)
             .ok_or_else(|| format!("node not found: {}", node_id))?;
+        // Merge nodes receive all predecessor outputs keyed by source node id; others get previous node output.
+        if node.node_type == "Merge" {
+            let preds = pred.get(&node_id).cloned().unwrap_or_default();
+            last_output = merged_predecessor_outputs(&context, &preds);
+        }
         let (new_ctx, new_out) = run_single_node(
             pool,
             node_registry.as_ref(),
@@ -301,23 +324,27 @@ pub async fn run_next_step(
         context = Value::Object(serde_json::Map::new());
     }
     ensure_context_shape(&mut context);
-    let last_output = order
-        .iter()
-        .take_while(|id| *id != &next_node_id)
-        .filter(|id| completed.contains(*id))
-        .last()
-        .and_then(|id| {
-            context
-                .get("nodes")
-                .and_then(|n| n.as_object())
-                .and_then(|n| n.get(id))
-                .cloned()
-        })
-        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-
     let node = nodes_by_id
         .get(&next_node_id)
         .ok_or_else(|| format!("node not found: {}", next_node_id))?;
+    let last_output = if node.node_type == "Merge" {
+        let preds = pred.get(&next_node_id).cloned().unwrap_or_default();
+        merged_predecessor_outputs(&context, &preds)
+    } else {
+        order
+            .iter()
+            .take_while(|id| *id != &next_node_id)
+            .filter(|id| completed.contains(*id))
+            .last()
+            .and_then(|id| {
+                context
+                    .get("nodes")
+                    .and_then(|n| n.as_object())
+                    .and_then(|n| n.get(id))
+                    .cloned()
+            })
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+    };
 
     let (new_context, _) = run_single_node(
         pool,

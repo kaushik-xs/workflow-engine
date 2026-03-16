@@ -4,10 +4,12 @@ use serde_json::Value;
 pub use crate::executor::ExecutionContext;
 pub use http_request::HttpRequestExecutor;
 pub use http_trigger::HttpTriggerExecutor;
+pub use merge::MergeExecutor;
 pub use service_call::ServiceCallExecutor;
 
 mod http_request;
 mod http_trigger;
+mod merge;
 mod service_call;
 
 #[async_trait]

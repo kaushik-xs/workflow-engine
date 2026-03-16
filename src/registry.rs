@@ -2,7 +2,7 @@ use crate::nodes::NodeExecutor;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::nodes::{HttpRequestExecutor, HttpTriggerExecutor, ServiceCallExecutor};
+use crate::nodes::{HttpRequestExecutor, HttpTriggerExecutor, MergeExecutor, ServiceCallExecutor};
 
 pub trait NodeRegistry: Send + Sync {
     fn get(&self, node_type: &str) -> Option<Arc<dyn NodeExecutor>>;
@@ -18,6 +18,7 @@ impl DefaultNodeRegistry {
         let mut map: HashMap<String, Arc<dyn NodeExecutor>> = HashMap::new();
         map.insert("HttpTrigger".to_string(), Arc::new(HttpTriggerExecutor));
         map.insert("HttpRequest".to_string(), Arc::new(HttpRequestExecutor::default()));
+        map.insert("Merge".to_string(), Arc::new(MergeExecutor));
         let service_call: Arc<dyn NodeExecutor> = match pool {
             Some(p) => Arc::new(ServiceCallExecutor::new(p)),
             None => Arc::new(ServiceCallExecutor::default()),
