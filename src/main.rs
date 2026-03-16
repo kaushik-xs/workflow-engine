@@ -86,13 +86,12 @@ struct StepItem {
 }
 
 const TENANT_HEADER: &str = "x-tenant-id";
-const DEFAULT_TENANT: Uuid = uuid::uuid!("00000000-0000-0000-0000-000000000000");
 
-fn tenant_from_headers(headers: &axum::http::HeaderMap) -> Option<Uuid> {
+fn tenant_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(TENANT_HEADER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s.trim()).ok())
+        .map(|s| s.trim().to_string())
 }
 
 /// Parse version from JSON value (number or numeric string). Returns None if missing/invalid.
@@ -153,7 +152,13 @@ async fn create_workflow(
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<CreateWorkflowResponse>), AppError> {
-    let tenant_id = tenant_from_headers(&headers).unwrap_or(DEFAULT_TENANT);
+    let tenant = body
+        .get("tenant")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| tenant_from_headers(&headers))
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("tenant is required (provide in body or X-Tenant-ID header)".into()))?;
     let (name, version, definition) = if body.get("definition").is_some() {
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed").to_string();
         let definition = body
@@ -181,7 +186,7 @@ async fn create_workflow(
         ));
     }
 
-    let w = storage::create_workflow(&state.pool, tenant_id, &name, version, &definition)
+    let w = storage::create_workflow(&state.pool, &tenant, &name, version, &definition)
         .await
         .map_err(AppError::from)?;
     Ok((
@@ -200,10 +205,11 @@ async fn list_workflows(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<WorkflowListResponse>, AppError> {
-    let tenant_id = tenant_from_headers(&headers);
+    let tenant_header = tenant_from_headers(&headers);
+    let tenant = tenant_header.as_deref();
     let limit = 100_i64;
     let offset = 0_i64;
-    let rows = storage::list_workflows(&state.pool, tenant_id, limit, offset)
+    let rows = storage::list_workflows(&state.pool, tenant, limit, offset)
         .await
         .map_err(AppError::from)?;
     Ok(Json(WorkflowListResponse {
@@ -229,14 +235,14 @@ async fn get_workflow(
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
-    if let Some(tenant_id) = tenant_from_headers(&headers) {
-        if w.tenant_id != tenant_id {
+    if let Some(ref tenant) = tenant_from_headers(&headers) {
+        if w.tenant != *tenant {
             return Err(AppError::NotFound("workflow not found".into()));
         }
     }
     Ok(Json(serde_json::json!({
         "id": w.id,
-        "tenant_id": w.tenant_id,
+        "tenant": w.tenant,
         "name": w.name,
         "version": w.version,
         "is_latest": w.is_latest,
@@ -256,17 +262,19 @@ async fn update_workflow(
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
-    if let Some(tenant_id) = tenant_from_headers(&headers) {
-        if w.tenant_id != tenant_id {
+    if let Some(ref tenant) = tenant_from_headers(&headers) {
+        if w.tenant != *tenant {
             return Err(AppError::NotFound("workflow not found".into()));
         }
     }
+    let tenant = body.get("tenant").and_then(|v| v.as_str());
     let definition = body.get("definition").cloned();
     let is_latest = body.get("is_latest").and_then(|v| v.as_bool());
     let definition_ref = definition.as_ref();
     let updated = storage::update_workflow(
         &state.pool,
         id,
+        tenant,
         definition_ref,
         is_latest,
     )
@@ -275,7 +283,7 @@ async fn update_workflow(
     .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
     Ok(Json(serde_json::json!({
         "id": updated.id,
-        "tenant_id": updated.tenant_id,
+        "tenant": updated.tenant,
         "name": updated.name,
         "version": updated.version,
         "is_latest": updated.is_latest,
@@ -307,20 +315,21 @@ async fn trigger_webhook(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<WebhookResponse>, AppError> {
-    let tenant_id = tenant_from_headers(&headers);
+    let tenant_header = tenant_from_headers(&headers);
+    let tenant = tenant_header.as_deref();
     let version = query.version;
     let workflow = if let Ok(uuid) = Uuid::parse_str(&id_or_name) {
         storage::get_workflow_by_id(&state.pool, uuid)
             .await
             .map_err(AppError::from)?
     } else {
-        storage::get_workflow_by_name(&state.pool, &id_or_name, tenant_id, version)
+        storage::get_workflow_by_name(&state.pool, &id_or_name, tenant, version)
             .await
             .map_err(AppError::from)?
     }
     .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
-    if let Some(tid) = tenant_id {
-        if workflow.tenant_id != tid {
+    if let Some(t) = tenant {
+        if workflow.tenant != t {
             return Err(AppError::NotFound("workflow not found".into()));
         }
     }
@@ -361,13 +370,14 @@ async fn list_executions(
     headers: axum::http::HeaderMap,
     Query(query): Query<ExecutionsQuery>,
 ) -> Result<Json<ExecutionListResponse>, AppError> {
-    let tenant_id = tenant_from_headers(&headers);
+    let tenant_header = tenant_from_headers(&headers);
+    let tenant = tenant_header.as_deref();
     let limit = 100_i64;
     let offset = 0_i64;
     let rows = storage::list_executions(
         &state.pool,
         query.workflow_id,
-        tenant_id,
+        tenant,
         limit,
         offset,
     )
@@ -398,12 +408,12 @@ async fn get_execution(
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::NotFound("execution not found".into()))?;
-    if let Some(tenant_id) = tenant_from_headers(&headers) {
+    if let Some(ref tenant) = tenant_from_headers(&headers) {
         let w = storage::get_workflow_by_id(&state.pool, exec.workflow_id)
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::NotFound("execution not found".into()))?;
-        if w.tenant_id != tenant_id {
+        if w.tenant != *tenant {
             return Err(AppError::NotFound("execution not found".into()));
         }
     }

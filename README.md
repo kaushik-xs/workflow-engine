@@ -33,7 +33,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | /workflows | Create workflow (body: React Flow JSON or `{ "name", "version", "definition" }`; version is a number, default `1`; new workflow is set as latest for that name) |
+| POST | /workflows | Create workflow (body: React Flow JSON or `{ "name", "tenant", "version", "definition" }`; **tenant** is required; version default `1`; new workflow is set as latest for that name) |
 | GET | /workflows | List workflows (each includes `version`, `is_latest`) |
 | GET | /workflows/:id | Get workflow by id (includes `version`, `is_latest`) |
 | PUT | /workflows/:id | Update workflow (body: `{ "definition"?, "is_latest"? }`; set `is_latest: true` to mark as latest for that name) |
@@ -42,8 +42,8 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 
 ## Versioning and latest
 
-- **Workflows** have a numeric `version` (1, 2, 3, …). Set it in the create body or in `definition.version`; default is `1`. Unique key is `(tenant_id, name, version)`.
-- **is_latest**: For each `(tenant_id, name)`, one workflow can be marked as latest. New workflows are created with `is_latest: true` (and others with the same name are unmarked). Use **PUT /workflows/:id** with `"is_latest": true` to mark a different version as latest.
+- **Workflows** have a numeric `version` (1, 2, 3, …). Set it in the create body or in `definition.version`; default is `1`. Unique key is `(tenant, name, version)`.
+- **is_latest**: For each `(tenant, name)`, one workflow can be marked as latest. New workflows are created with `is_latest: true` (and others with the same name are unmarked). Use **PUT /workflows/:id** with `"is_latest": true` to mark a different version as latest.
 - **Executions** store the `workflow_version` (integer) that was run.
 - When triggering by **name** without `?version=`, the workflow with `is_latest = true` is used; with `?version=1` the specified version is used.
 
@@ -85,21 +85,25 @@ Import the collection from `postman/Workflow-Engine-API.postman_collection.json`
 | `base_url`     | http://localhost:3000 | API base URL |
 | `workflow_id`  | (set by Create Workflow) | Used by Get Workflow, Trigger Webhook |
 | `execution_id` | (set by Trigger Webhook) | Used by Get Execution |
-| `tenant_id`    | (empty)              | Optional. Set to a tenant UUID to scope requests via X-Tenant-ID header. |
+| `tenant`       | (empty)              | Required for create. Set to a tenant value (body or X-Tenant-ID header). Optional for list/get to scope by tenant. |
 
 Run **Create Workflow** then **Trigger Workflow** then **Get Execution** to exercise the full flow; variables are set automatically by test scripts.
 
-## Multi-tenant (X-Tenant-ID)
+## Multi-tenant (tenant)
 
-All workflow and execution endpoints accept an optional **`X-Tenant-ID`** header (UUID). When set:
+**Tenant is mandatory** and has no default. Workflows store a **`tenant`** value (string).
 
-- **POST /workflows** – New workflow is created under that tenant (otherwise default tenant).
+- **POST /workflows** – **tenant** is required: send it in the request body or in the **X-Tenant-ID** header (non-empty). The value is stored in the workflow table.
+- **PUT /workflows/:id** – Optional `tenant` in the body updates the workflow's stored tenant.
+
+All workflow and execution endpoints accept an optional **X-Tenant-ID** header to scope requests. When set:
+
 - **GET /workflows** – Only workflows for that tenant are returned.
 - **GET /workflows/:id** – Returns 404 if the workflow’s tenant does not match.
 - **POST /webhook/:id** – When triggering by name, lookup is scoped to that tenant; when by UUID, workflow must belong to that tenant.
 - **GET /executions/:id** – Returns 404 if the execution’s workflow belongs to a different tenant.
 
-Omit the header to use the default tenant (e.g. single-tenant mode).
+Omit the header to see all tenants when listing; for create, tenant must be provided (body or header).
 
 ## Configuration
 

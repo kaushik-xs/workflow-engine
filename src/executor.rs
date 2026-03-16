@@ -13,7 +13,7 @@ pub struct ExecutionContext {
     pub context: Value,
     pub workflow_id: Uuid,
     pub execution_id: Uuid,
-    pub tenant_id: Option<Uuid>,
+    pub tenant: Option<String>,
 }
 
 impl ExecutionContext {
@@ -22,7 +22,7 @@ impl ExecutionContext {
             context: initial_context,
             workflow_id,
             execution_id,
-            tenant_id: None,
+            tenant: None,
         }
     }
 

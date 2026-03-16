@@ -1,14 +1,14 @@
 {
   "info": {
     "name": "Workflow Engine API",
-    "description": "REST API for the workflow execution engine. Optional header: X-Tenant-ID (UUID) to scope workflows by tenant. Variables: `base_url`, `workflow_id`, `execution_id`, `tenant_id`.",
+    "description": "REST API for the workflow execution engine. Optional header: X-Tenant-ID to scope workflows by tenant. Request body can include `tenant` on create/update; it is stored in the workflow table. Variables: `base_url`, `workflow_id`, `execution_id`, `tenant`.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     { "key": "base_url", "value": "http://localhost:3000", "type": "string" },
     { "key": "workflow_id", "value": "", "type": "string" },
     { "key": "execution_id", "value": "", "type": "string" },
-    { "key": "tenant_id", "value": "", "type": "string", "description": "Optional. Set to a tenant UUID to scope list/get/trigger by tenant; leave empty for default tenant." }
+    { "key": "tenant", "value": "", "type": "string", "description": "Required for create (non-empty). Optional for list/get/trigger to scope by tenant." }
   ],
   "item": [
     {
@@ -34,14 +34,14 @@
             "method": "POST",
             "header": [
               { "key": "Content-Type", "value": "application/json" },
-              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. Tenant UUID; workflow is created under this tenant." }
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. Tenant value; workflow is created under this tenant if body does not set tenant." }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"triggerType\": \"httpTrigger\",\n  \"id\": \"sample\",\n  \"name\": \"sample\",\n  \"description\": \"This is a sample workflow\",\n  \"version\": 1,\n  \"data\": {\n    \"nodes\": [\n      {\n        \"id\": \"trigger-1\",\n        \"type\": \"httpTrigger\",\n        \"data\": {\n          \"method\": \"POST\",\n          \"path\": \"/trial\",\n          \"authentication\": \"bearer\"\n        }\n      },\n      {\n        \"id\": \"service-1\",\n        \"type\": \"serviceCall\",\n        \"data\": {\n          \"serviceName\": \"Authentication Service\",\n          \"operation\": \"recheck\",\n          \"serviceSlug\": \"authrs\",\n          \"method\": \"POST\",\n          \"path\": \"/api/licenses/recheck\"\n        }\n      }\n    ],\n    \"edges\": [\n      { \"source\": \"trigger-1\", \"target\": \"service-1\", \"id\": \"e1\" }\n    ]\n  }\n}"
+              "raw": "{\n  \"triggerType\": \"httpTrigger\",\n  \"id\": \"sample\",\n  \"name\": \"sample\",\n  \"tenant\": \"my-tenant\",\n  \"description\": \"This is a sample workflow\",\n  \"version\": 1,\n  \"data\": {\n    \"nodes\": [\n      {\n        \"id\": \"trigger-1\",\n        \"type\": \"httpTrigger\",\n        \"data\": {\n          \"method\": \"POST\",\n          \"path\": \"/trial\",\n          \"authentication\": \"bearer\"\n        }\n      },\n      {\n        \"id\": \"service-1\",\n        \"type\": \"serviceCall\",\n        \"data\": {\n          \"serviceName\": \"Authentication Service\",\n          \"operation\": \"recheck\",\n          \"serviceSlug\": \"authrs\",\n          \"method\": \"POST\",\n          \"path\": \"/api/licenses/recheck\"\n        }\n      }\n    ],\n    \"edges\": [\n      { \"source\": \"trigger-1\", \"target\": \"service-1\", \"id\": \"e1\" }\n    ]\n  }\n}"
             },
             "url": "{{base_url}}/workflows",
-            "description": "Create a workflow. Optional `version` (number, e.g. 1); default 1. New workflow is set as latest for that name. Response includes id, name, version, is_latest, created_at. Saves `id` to `workflow_id`."
+            "description": "Create a workflow. **tenant** is required (string, in body or X-Tenant-ID header, non-empty). Optional `version` (number, default 1). New workflow is set as latest for that name. Response includes id, name, version, is_latest, created_at. Saves `id` to `workflow_id`."
           }
         },
         {
@@ -49,7 +49,7 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. Tenant UUID; only workflows for this tenant are returned." }
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. Only workflows for this tenant are returned." }
             ],
             "url": "{{base_url}}/workflows",
             "description": "List workflows (id, name, version, is_latest, created_at). If X-Tenant-ID is set, only that tenant's workflows are returned."
@@ -60,10 +60,10 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. If set, returns 404 when workflow belongs to a different tenant." }
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. If set, returns 404 when workflow belongs to a different tenant." }
             ],
             "url": "{{base_url}}/workflows/{{workflow_id}}",
-            "description": "Get a single workflow (id, name, version, is_latest, definition, etc.). Uses variable `workflow_id`. With X-Tenant-ID, workflow must belong to that tenant."
+            "description": "Get a single workflow (id, tenant, name, version, is_latest, definition, etc.). Uses variable `workflow_id`. With X-Tenant-ID, workflow must belong to that tenant."
           }
         },
         {
@@ -72,14 +72,14 @@
             "method": "PUT",
             "header": [
               { "key": "Content-Type", "value": "application/json" },
-              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. Workflow must belong to this tenant." }
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. Workflow must belong to this tenant." }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"definition\": { \"data\": { \"nodes\": [], \"edges\": [] } },\n  \"is_latest\": true\n}"
+              "raw": "{\n  \"tenant\": \"\",\n  \"definition\": { \"data\": { \"nodes\": [], \"edges\": [] } },\n  \"is_latest\": true\n}"
             },
             "url": "{{base_url}}/workflows/{{workflow_id}}",
-            "description": "Update workflow by id. Body: optional \"definition\" (full React Flow JSON), optional \"is_latest\" (true to mark this workflow as the latest for its name). At least one field should be provided."
+            "description": "Update workflow by id. Body: optional \"tenant\" (string, stored in workflow), optional \"definition\" (full React Flow JSON), optional \"is_latest\" (true to mark this workflow as the latest for its name). At least one field should be provided."
           }
         }
       ]
@@ -107,7 +107,7 @@
             "method": "POST",
             "header": [
               { "key": "Content-Type", "value": "application/json" },
-              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. When triggering by name, lookup is scoped to this tenant; when by UUID, workflow must belong to this tenant." },
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. When triggering by name, lookup is scoped to this tenant; when by UUID, workflow must belong to this tenant." },
               { "key": "X-Custom-Header", "value": "example", "description": "Optional; headers are stored in Webhook context" }
             ],
             "body": {
@@ -138,7 +138,7 @@
             "method": "POST",
             "header": [
               { "key": "Content-Type", "value": "application/json" },
-              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. Lookup by name is scoped to this tenant." }
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. Lookup by name is scoped to this tenant." }
             ],
             "body": {
               "mode": "raw",
@@ -158,7 +158,7 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. If set, only executions for workflows belonging to this tenant are returned." }
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. If set, only executions for workflows belonging to this tenant are returned." }
             ],
             "url": {
               "raw": "{{base_url}}/executions?workflow_id={{workflow_id}}",
@@ -176,7 +176,7 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Optional. If set, returns 404 when the execution's workflow belongs to a different tenant." }
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. If set, returns 404 when the execution's workflow belongs to a different tenant." }
             ],
             "url": "{{base_url}}/executions/{{execution_id}}",
             "description": "Get execution (id, workflow_id, workflow_version, status, context, steps, etc.). Uses variable execution_id. X-Tenant-ID enforces tenant."
