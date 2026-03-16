@@ -187,7 +187,12 @@ fn merged_predecessor_outputs(context: &Value, preds: &[String]) -> Value {
     let mut map = serde_json::Map::new();
     for p in preds {
         if let Some(out) = nodes.get(p) {
-            map.insert(p.clone(), out.clone());
+            // Put body content directly under node id when present (e.g. HTTP-style output); otherwise full output.
+            let value = out
+                .get("body")
+                .cloned()
+                .unwrap_or_else(|| out.clone());
+            map.insert(p.clone(), value);
         }
     }
     Value::Object(map)
