@@ -29,7 +29,11 @@ impl NodeExecutor for MergeExecutor {
                     .get("current")
                     .cloned()
                     .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-                Ok(merged)
+                // Return HTTP-response-shaped object: status + body (merged data).
+                Ok(serde_json::json!({
+                    "status": 200,
+                    "body": merged
+                }))
             }
             _ => Err(format!("unsupported mergeType: {}", merge_type)),
         }
