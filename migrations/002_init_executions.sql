@@ -3,7 +3,7 @@ CREATE TABLE workflow_executions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workflow_id UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
     workflow_version INTEGER,
-    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'paused')),
     context JSONB NOT NULL DEFAULT '{}',
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at TIMESTAMPTZ

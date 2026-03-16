@@ -242,16 +242,19 @@ pub async fn create_execution(
     workflow_id: Uuid,
     workflow_version: Option<i32>,
     context: &serde_json::Value,
+    initial_status: Option<&str>,
 ) -> Result<WorkflowExecution, sqlx::Error> {
+    let status = initial_status.unwrap_or("running");
     let row = sqlx::query_as::<_, WorkflowExecution>(
         r#"
         INSERT INTO workflow_executions (workflow_id, workflow_version, status, context)
-        VALUES ($1, $2, 'running', $3)
+        VALUES ($1, $2, $3, $4)
         RETURNING id, workflow_id, workflow_version, status, context, started_at, finished_at
         "#,
     )
     .bind(workflow_id)
     .bind(workflow_version)
+    .bind(status)
     .bind(context)
     .fetch_one(pool)
     .await?;

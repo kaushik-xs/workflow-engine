@@ -102,6 +102,81 @@ fn ensure_context_shape(context: &mut Value) {
     }
 }
 
+/// Result of running one step (for step-by-step mode).
+#[derive(Debug)]
+pub struct RunNextStepResult {
+    pub status: String,
+    pub context: Value,
+}
+
+/// Run a single node and persist execution + step. Returns updated (context, last_output) or Err on failure.
+async fn run_single_node(
+    pool: &sqlx::PgPool,
+    node_registry: &dyn NodeRegistry,
+    workflow_id: Uuid,
+    execution_id: Uuid,
+    context: Value,
+    last_output: Value,
+    node: &NodeSpec,
+) -> Result<(Value, Value), String> {
+    let executor = node_registry
+        .get(&node.node_type)
+        .ok_or_else(|| format!("unknown node type: {}", node.node_type))?;
+
+    let mut exec_ctx = ExecutionContext::new(workflow_id, execution_id, context);
+    exec_ctx.set_current(last_output);
+
+    let mut input = node.input.clone();
+    let mut config = node.config.clone();
+    expression::interpolate_value(&mut input, &exec_ctx.context).map_err(|e| e.to_string())?;
+    expression::interpolate_value(&mut config, &exec_ctx.context).map_err(|e| e.to_string())?;
+
+    tracing::info!(
+        execution_id = %execution_id,
+        node_id = %node.id,
+        node_type = %node.node_type,
+        "executing node"
+    );
+
+    match executor
+        .execute(&exec_ctx, &node.id, input, config)
+        .await
+    {
+        Ok(output) => {
+            exec_ctx.set_node_output(&node.id, output.clone());
+            let context = exec_ctx.context;
+            storage::update_execution(pool, execution_id, "running", &context, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            storage::insert_step(pool, execution_id, &node.id, "completed", Some(&output), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok((context, output))
+        }
+        Err(e) => {
+            storage::update_execution(
+                pool,
+                execution_id,
+                "failed",
+                &exec_ctx.context,
+                Some(chrono::Utc::now()),
+            )
+            .await
+            .map_err(|e2| e2.to_string())?;
+            let _ = storage::insert_step(
+                pool,
+                execution_id,
+                &node.id,
+                "failed",
+                None,
+                Some(&e),
+            )
+            .await;
+            Err(e)
+        }
+    }
+}
+
 /// Run workflow to completion (or first failure). Updates execution and steps in DB.
 pub async fn run_workflow(
     pool: &sqlx::PgPool,
@@ -128,73 +203,18 @@ pub async fn run_workflow(
         let node = nodes_by_id
             .get(&node_id)
             .ok_or_else(|| format!("node not found: {}", node_id))?;
-        let executor = node_registry
-            .get(&node.node_type)
-            .ok_or_else(|| format!("unknown node type: {}", node.node_type))?;
-
-        let mut exec_ctx = ExecutionContext::new(workflow_id, execution_id, context.clone());
-        exec_ctx.set_current(last_output.clone());
-
-        let mut input = node.input.clone();
-        let mut config = node.config.clone();
-        expression::interpolate_value(&mut input, &exec_ctx.context).map_err(|e| e.to_string())?;
-        expression::interpolate_value(&mut config, &exec_ctx.context).map_err(|e| e.to_string())?;
-
-        tracing::info!(
-            execution_id = %execution_id,
-            node_id = %node_id,
-            node_type = %node.node_type,
-            context = %serde_json::to_string(&exec_ctx.context).unwrap_or_default(),
-            "execution context before node execution"
-        );
-
-        match executor.execute(&exec_ctx, &node_id, input, config).await {
-            Ok(output) => {
-                last_output = output.clone();
-                exec_ctx.set_node_output(&node_id, output.clone());
-                context = exec_ctx.context;
-                storage::update_execution(
-                    pool,
-                    execution_id,
-                    "running",
-                    &context,
-                    None,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                storage::insert_step(
-                    pool,
-                    execution_id,
-                    &node_id,
-                    "completed",
-                    Some(&output),
-                    None,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            }
-            Err(e) => {
-                storage::update_execution(
-                    pool,
-                    execution_id,
-                    "failed",
-                    &context,
-                    Some(chrono::Utc::now()),
-                )
-                .await
-                .map_err(|e2| e2.to_string())?;
-                let _ = storage::insert_step(
-                    pool,
-                    execution_id,
-                    &node_id,
-                    "failed",
-                    None,
-                    Some(&e),
-                )
-                .await;
-                return Err(e);
-            }
-        }
+        let (new_ctx, new_out) = run_single_node(
+            pool,
+            node_registry.as_ref(),
+            workflow_id,
+            execution_id,
+            context,
+            last_output,
+            node,
+        )
+        .await?;
+        context = new_ctx;
+        last_output = new_out;
     }
 
     storage::update_execution(
@@ -207,4 +227,135 @@ pub async fn run_workflow(
     .await
     .map_err(|e| e.to_string())?;
     Ok(context)
+}
+
+/// Predecessors: for each node_id, the set of node ids that must complete before it (sources of edges targeting it).
+fn predecessors_by_node(
+    edges: &[crate::definition::EdgeSpec],
+    node_ids: &HashSet<String>,
+) -> HashMap<String, Vec<String>> {
+    let mut pred: HashMap<String, Vec<String>> =
+        node_ids.iter().cloned().map(|id| (id, Vec::new())).collect();
+    for e in edges {
+        if node_ids.contains(&e.source) && node_ids.contains(&e.target) && e.source != e.target {
+            pred.get_mut(&e.target).unwrap().push(e.source.clone());
+        }
+    }
+    pred
+}
+
+/// Run the next runnable step for a paused execution. Execution must be in `paused` status.
+/// Loads steps from DB to determine which node to run next; updates execution and step; returns new status and context.
+pub async fn run_next_step(
+    pool: &sqlx::PgPool,
+    node_registry: Arc<dyn NodeRegistry>,
+    execution_id: Uuid,
+    workflow_id: Uuid,
+    definition: &Value,
+    mut context: Value,
+) -> Result<RunNextStepResult, String> {
+    let (node_specs, edge_specs) = definition::parse_workflow(definition)?;
+    let order = topological_order(&node_specs, &edge_specs);
+    let node_ids: HashSet<String> = node_specs.iter().map(|n| n.id.clone()).collect();
+    let nodes_by_id: HashMap<String, &NodeSpec> =
+        node_specs.iter().map(|n| (n.id.clone(), n)).collect();
+    let pred = predecessors_by_node(&edge_specs, &node_ids);
+
+    let steps = storage::list_steps_by_execution(pool, execution_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let completed: HashSet<String> = steps
+        .iter()
+        .filter(|s| s.status == "completed" || s.status == "failed")
+        .map(|s| s.node_id.clone())
+        .collect();
+
+    let next_node_id = order.iter().find(|node_id| {
+        !completed.contains(*node_id)
+            && pred
+                .get(*node_id)
+                .map(|preds| preds.iter().all(|p| completed.contains(p)))
+                .unwrap_or(true)
+    });
+
+    let next_node_id = match next_node_id {
+        Some(id) => id.clone(),
+        None => {
+            storage::update_execution(
+                pool,
+                execution_id,
+                "completed",
+                &context,
+                Some(chrono::Utc::now()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            return Ok(RunNextStepResult {
+                status: "completed".to_string(),
+                context: context.clone(),
+            });
+        }
+    };
+
+    if !context.is_object() {
+        context = Value::Object(serde_json::Map::new());
+    }
+    ensure_context_shape(&mut context);
+    let last_output = order
+        .iter()
+        .take_while(|id| *id != &next_node_id)
+        .filter(|id| completed.contains(*id))
+        .last()
+        .and_then(|id| {
+            context
+                .get("nodes")
+                .and_then(|n| n.as_object())
+                .and_then(|n| n.get(id))
+                .cloned()
+        })
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+
+    let node = nodes_by_id
+        .get(&next_node_id)
+        .ok_or_else(|| format!("node not found: {}", next_node_id))?;
+
+    let (new_context, _) = run_single_node(
+        pool,
+        node_registry.as_ref(),
+        workflow_id,
+        execution_id,
+        context,
+        last_output,
+        node,
+    )
+    .await?;
+
+    let steps_after = storage::list_steps_by_execution(pool, execution_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let completed_after: HashSet<String> = steps_after
+        .iter()
+        .filter(|s| s.status == "completed" || s.status == "failed")
+        .map(|s| s.node_id.clone())
+        .collect();
+    let more_remaining = order.iter().any(|id| !completed_after.contains(id));
+
+    let status = if more_remaining {
+        "paused"
+    } else {
+        "completed"
+    };
+    let finished_at = if more_remaining {
+        None
+    } else {
+        Some(chrono::Utc::now())
+    };
+    storage::update_execution(pool, execution_id, status, &new_context, finished_at)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(RunNextStepResult {
+        status: status.to_string(),
+        context: new_context,
+    })
 }

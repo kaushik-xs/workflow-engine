@@ -133,6 +133,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .route("/webhook/:id", post(trigger_webhook))
         .route("/executions", get(list_executions))
         .route("/executions/:id", get(get_execution))
+        .route("/executions/:id/step", post(run_next_step_handler))
         .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state);
@@ -301,6 +302,8 @@ struct WebhookPath {
 #[derive(serde::Deserialize, Default)]
 struct WebhookQuery {
     version: Option<i32>,
+    #[serde(rename = "step")]
+    step: Option<bool>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -335,14 +338,24 @@ async fn trigger_webhook(
     }
 
     let initial_context = triggers::webhook_context_from_request(body, &headers);
+    let step_mode = query.step == Some(true);
+    let initial_status = if step_mode { Some("paused") } else { None };
     let exec = storage::create_execution(
         &state.pool,
         workflow.id,
         Some(workflow.version),
         &initial_context,
+        initial_status,
     )
     .await
     .map_err(AppError::from)?;
+
+    if step_mode {
+        return Ok(Json(WebhookResponse {
+            execution_id: exec.id,
+            status: "paused".to_string(),
+        }));
+    }
 
     let result = executor::run_workflow(
         &state.pool,
@@ -418,6 +431,71 @@ async fn get_execution(
         }
     }
 
+    let steps = storage::list_steps_by_execution(&state.pool, id)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok(Json(ExecutionResponse {
+        id: exec.id,
+        workflow_id: exec.workflow_id,
+        workflow_version: exec.workflow_version,
+        status: exec.status,
+        context: exec.context,
+        started_at: exec.started_at.to_rfc3339(),
+        finished_at: exec.finished_at.map(|t| t.to_rfc3339()),
+        steps: steps
+            .into_iter()
+            .map(|s| StepItem {
+                node_id: s.node_id,
+                status: s.status,
+                output: s.output,
+            })
+            .collect(),
+    }))
+}
+
+async fn run_next_step_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ExecutionResponse>, AppError> {
+    let exec = storage::get_execution(&state.pool, id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::NotFound("execution not found".into()))?;
+    if let Some(ref tenant) = tenant_from_headers(&headers) {
+        let w = storage::get_workflow_by_id(&state.pool, exec.workflow_id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError::NotFound("execution not found".into()))?;
+        if w.tenant != *tenant {
+            return Err(AppError::NotFound("execution not found".into()));
+        }
+    }
+    if exec.status != "paused" {
+        return Err(AppError::BadRequest(
+            "Execution is not in paused state.".into(),
+        ));
+    }
+    let workflow = storage::get_workflow_by_id(&state.pool, exec.workflow_id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
+
+    let _ = executor::run_next_step(
+        &state.pool,
+        state.node_registry.clone(),
+        id,
+        exec.workflow_id,
+        &workflow.definition,
+        exec.context,
+    )
+    .await;
+
+    let exec = storage::get_execution(&state.pool, id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::NotFound("execution not found".into()))?;
     let steps = storage::list_steps_by_execution(&state.pool, id)
         .await
         .map_err(AppError::from)?;

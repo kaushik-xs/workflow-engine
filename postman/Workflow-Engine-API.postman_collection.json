@@ -147,6 +147,36 @@
             "url": "{{base_url}}/webhook/sample?version=1",
             "description": "Trigger by name. Optional ?version=1; omit to use the workflow marked is_latest for that name. X-Tenant-ID scopes by tenant."
           }
+        },
+        {
+          "name": "Trigger Webhook (step mode)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const json = pm.response.json();",
+                  "    pm.collectionVariables.set('execution_id', json.execution_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional." }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"hello\": \"world\",\n  \"customer_name\": \"Acme Corp\"\n}"
+            },
+            "url": "{{base_url}}/webhook/{{workflow_id}}?step=true",
+            "description": "Start workflow in step-by-step (debug) mode. Creates an execution with status paused and does not run any nodes. Use Run next step to advance. Saves execution_id."
+          }
         }
       ]
     },
@@ -180,6 +210,17 @@
             ],
             "url": "{{base_url}}/executions/{{execution_id}}",
             "description": "Get execution (id, workflow_id, workflow_version, status, context, steps, etc.). Uses variable execution_id. X-Tenant-ID enforces tenant."
+          }
+        },
+        {
+          "name": "Run next step",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. Execution's workflow must belong to this tenant." }
+            ],
+            "url": "{{base_url}}/executions/{{execution_id}}/step",
+            "description": "Run the next step for a paused execution (step-by-step mode). Execution must be in paused state. Returns execution with updated status and steps. Use execution_id from Trigger Webhook (step mode)."
           }
         }
       ]

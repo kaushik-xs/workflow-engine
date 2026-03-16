@@ -37,8 +37,9 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 | GET | /workflows | List workflows (each includes `version`, `is_latest`) |
 | GET | /workflows/:id | Get workflow by id (includes `version`, `is_latest`) |
 | PUT | /workflows/:id | Update workflow (body: `{ "definition"?, "is_latest"? }`; set `is_latest: true` to mark as latest for that name) |
-| POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
+| POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name; optional `?step=true` for step-by-step (debug) mode. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
 | GET | /executions/:id | Get execution (includes `workflow_version` that was run) |
+| POST | /executions/:id/step | Run the next step for a paused execution (step-by-step mode). Returns the execution with updated status and steps. |
 
 ## Versioning and latest
 
@@ -52,6 +53,18 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 - **HttpTrigger** – Entry point; Webhook context is set by the HTTP layer.
 - **HttpRequest** – Calls an external HTTP API (config: `method`, `url` or `path`, optional `body`/`headers`).
 - **ServiceCall** – Calls an internal service (config: `serviceSlug`, `operation`). Uses the registered service registry (stub `authrs` by default).
+
+## Step-by-step execution (debug mode)
+
+You can run a workflow one node at a time for debugging. Execution state is stored in the database so you can continue later.
+
+1. **Start in step mode**: Trigger the webhook with `?step=true` (e.g. `POST /webhook/:id?step=true`). The server creates an execution with status `paused` and does not run any nodes. The response returns `execution_id` and `status: "paused"`.
+
+2. **Advance one step**: Call `POST /executions/:id/step` with the execution id. The server runs the next runnable node (by workflow order), updates the execution context and step row, then sets status to `paused` again if more nodes remain, or `completed` / `failed` otherwise. The response is the same shape as GET /executions/:id (execution with steps).
+
+3. **Resume**: Keep calling `POST /executions/:id/step` until the workflow is completed or failed. You can stop and resume later; state is persisted in `workflow_executions.context` and `workflow_steps`.
+
+If you call **Run next step** when the execution is not `paused` (e.g. already completed or failed), the API returns 400 with message "Execution is not in paused state."
 
 ## Expressions
 
