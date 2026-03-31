@@ -110,6 +110,14 @@ impl NodeExecutor for HttpRequestExecutor {
             Value::String(String::from_utf8_lossy(&bytes).into_owned())
         });
 
+        tracing::debug!(
+            execution_id = %ctx.execution_id,
+            node_type = "httpRequest",
+            status = status,
+            response_body = ?body_value,
+            "http request response"
+        );
+
         Ok(serde_json::json!({
             "status": status,
             "body": body_value,

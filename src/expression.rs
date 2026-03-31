@@ -7,6 +7,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use tracing;
 
 /// Global cache of compiled JMESPath expressions. JMESPath is pure data lookup only (no arbitrary code).
 static COMPILED_CACHE: std::sync::OnceLock<Mutex<HashMap<String, jmespath::Expression<'static>>>> =
@@ -31,11 +32,20 @@ fn get_compiled(expr_str: &str) -> Result<jmespath::Expression<'static>, String>
 
 /// Evaluate a single JMESPath expression against context (JSON value).
 pub fn evaluate(expression: &str, context: &Value) -> Result<Value, String> {
-    let expr = get_compiled(expression.trim())?;
+    let expr_str = expression.trim();
+    tracing::debug!(expression = %expr_str, "evaluating jmespath expression");
+
+    let expr = get_compiled(expr_str)?;
     let json_str = serde_json::to_string(context).map_err(|e| e.to_string())?;
     let variable = jmespath::Variable::from_json(&json_str).map_err(|e| e.to_string())?;
-    let result = expr.search(variable).map_err(|e| e.to_string())?;
-    serde_json::to_value(&result).map_err(|e| e.to_string())
+    let result = expr.search(variable).map_err(|e| {
+        let msg = e.to_string();
+        tracing::debug!(expression = %expr_str, error = %msg, "jmespath evaluation error");
+        msg
+    })?;
+    let value = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+    tracing::debug!(expression = %expr_str, result = ?value, "jmespath evaluation result");
+    Ok(value)
 }
 
 /// Find all {{ expression }} placeholders in a string. Returns (start, end, expression text).

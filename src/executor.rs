@@ -128,8 +128,24 @@ async fn run_single_node(
 
     let mut input = node.input.clone();
     let mut config = node.config.clone();
+    tracing::debug!(
+        execution_id = %execution_id,
+        node_id = %node.id,
+        node_type = %node.node_type,
+        input_before = ?input,
+        config_before = ?config,
+        "interpolating node input and config"
+    );
     expression::interpolate_value(&mut input, &exec_ctx.context).map_err(|e| e.to_string())?;
     expression::interpolate_value(&mut config, &exec_ctx.context).map_err(|e| e.to_string())?;
+    tracing::debug!(
+        execution_id = %execution_id,
+        node_id = %node.id,
+        node_type = %node.node_type,
+        input_after = ?input,
+        config_after = ?config,
+        "interpolated node input and config"
+    );
 
     tracing::info!(
         execution_id = %execution_id,
@@ -143,6 +159,13 @@ async fn run_single_node(
         .await
     {
         Ok(output) => {
+            tracing::debug!(
+                execution_id = %execution_id,
+                node_id = %node.id,
+                node_type = %node.node_type,
+                output = ?output,
+                "node executed successfully"
+            );
             exec_ctx.set_node_output(&node.id, output.clone());
             let context = exec_ctx.context;
             storage::update_execution(pool, execution_id, "running", &context, None)

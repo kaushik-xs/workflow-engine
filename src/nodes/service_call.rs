@@ -163,6 +163,14 @@ impl NodeExecutor for ServiceCallExecutor {
                 Value::String(String::from_utf8_lossy(&bytes).into_owned())
             });
 
+            tracing::debug!(
+                execution_id = %ctx.execution_id,
+                node_type = "serviceCall",
+                status = status,
+                response_body = ?body_value,
+                "service call response (direct url)"
+            );
+
             return Ok(serde_json::json!({
                 "status": status,
                 "body": body_value,
@@ -235,6 +243,14 @@ impl NodeExecutor for ServiceCallExecutor {
         let body_value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
             Value::String(String::from_utf8_lossy(&bytes).into_owned())
         });
+
+        tracing::debug!(
+            execution_id = %ctx.execution_id,
+            node_type = "serviceCall",
+            status = status,
+            response_body = ?body_value,
+            "service call response (service slug)"
+        );
 
         Ok(serde_json::json!({
             "status": status,
