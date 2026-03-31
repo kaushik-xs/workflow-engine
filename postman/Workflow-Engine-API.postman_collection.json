@@ -115,7 +115,7 @@
               "raw": "{\n  \"hello\": \"world\",\n  \"customer_name\": \"Acme Corp\"\n}"
             },
             "url": "{{base_url}}/webhook/{{workflow_id}}",
-            "description": "Trigger by UUID or name. Without ?version=, the workflow marked is_latest for that name is used; use ?version=1 to run a specific version. Saves execution_id."
+            "description": "Trigger by UUID or name. Without ?version=, the workflow marked is_latest for that name is used; use ?version=1 to run a specific version. Response includes execution_id, status, result (last completed node output when completed), and error (when failed). Saves execution_id."
           }
         },
         {
@@ -145,7 +145,7 @@
               "raw": "{\n  \"hello\": \"world\"\n}"
             },
             "url": "{{base_url}}/webhook/sample?version=1",
-            "description": "Trigger by name. Optional ?version=1; omit to use the workflow marked is_latest for that name. X-Tenant-ID scopes by tenant."
+            "description": "Trigger by name. Optional ?version=1; omit to use the workflow marked is_latest for that name. X-Tenant-ID scopes by tenant. Response includes execution_id, status, result (last completed node output when completed), and error (when failed)."
           }
         },
         {
@@ -175,7 +175,7 @@
               "raw": "{\n  \"hello\": \"world\",\n  \"customer_name\": \"Acme Corp\"\n}"
             },
             "url": "{{base_url}}/webhook/{{workflow_id}}?step=true",
-            "description": "Start workflow in step-by-step (debug) mode. Creates an execution with status paused and does not run any nodes. Use Run next step to advance. Saves execution_id."
+            "description": "Start workflow in step-by-step (debug) mode. Creates an execution with status paused and does not run any nodes. Use Run next step to advance. Response includes execution_id, status=paused, result=null, error=null. Saves execution_id."
           }
         }
       ]

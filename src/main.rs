@@ -48,6 +48,8 @@ struct WorkflowListItem {
 struct WebhookResponse {
     execution_id: Uuid,
     status: String,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -354,6 +356,8 @@ async fn trigger_webhook(
         return Ok(Json(WebhookResponse {
             execution_id: exec.id,
             status: "paused".to_string(),
+            result: None,
+            error: None,
         }));
     }
 
@@ -367,14 +371,28 @@ async fn trigger_webhook(
     )
     .await;
 
-    let status = match &result {
-        Ok(_) => "completed",
-        Err(_) => "failed",
+    let (status, error) = match &result {
+        Ok(_) => ("completed", None),
+        Err(e) => ("failed", Some(e.clone())),
+    };
+    let result_body = if status == "completed" {
+        let steps = storage::list_steps_by_execution(&state.pool, exec.id)
+            .await
+            .map_err(AppError::from)?;
+        steps
+            .into_iter()
+            .rev()
+            .find(|s| s.status == "completed")
+            .and_then(|s| s.output)
+    } else {
+        None
     };
 
     Ok(Json(WebhookResponse {
         execution_id: exec.id,
         status: status.to_string(),
+        result: result_body,
+        error,
     }))
 }
 
