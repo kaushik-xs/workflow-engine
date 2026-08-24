@@ -125,6 +125,16 @@ pub async fn update_workflow(
     get_workflow_by_id(pool, id).await
 }
 
+pub async fn delete_workflow(pool: &sqlx::PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    // Executions (and their steps) are removed automatically via ON DELETE CASCADE
+    // on workflow_executions.workflow_id and workflow_steps.execution_id.
+    let result = sqlx::query(r#"DELETE FROM workflows WHERE id = $1"#)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn get_workflow_by_id(pool: &sqlx::PgPool, id: Uuid) -> Result<Option<Workflow>, sqlx::Error> {
     let row = sqlx::query_as::<_, Workflow>(
         r#"

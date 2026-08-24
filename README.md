@@ -37,6 +37,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 | GET | /workflows | List workflows (each includes `version`, `is_latest`) |
 | GET | /workflows/:id | Get workflow by id (includes `version`, `is_latest`) |
 | PUT | /workflows/:id | Update workflow (body: `{ "definition"?, "is_latest"? }`; set `is_latest: true` to mark as latest for that name) |
+| DELETE | /workflows/:id | Delete workflow by id. Also deletes all of the workflow's executions and their steps (cascade). Returns `{ "id", "deleted": true }`. |
 | POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name; optional `?step=true` for step-by-step (debug) mode. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
 | GET | /executions/:id | Get execution (includes `workflow_version` that was run) |
 | POST | /executions/:id/step | Run the next step for a paused execution (step-by-step mode). Returns the execution with updated status and steps. |
@@ -114,6 +115,7 @@ All workflow and execution endpoints accept an optional **X-Tenant-ID** header t
 
 - **GET /workflows** – Only workflows for that tenant are returned.
 - **GET /workflows/:id** – Returns 404 if the workflow’s tenant does not match.
+- **DELETE /workflows/:id** – Returns 404 if the workflow’s tenant does not match (nothing is deleted in that case).
 - **POST /webhook/:id** – When triggering by name, lookup is scoped to that tenant; when by UUID, workflow must belong to that tenant.
 - **GET /executions/:id** – Returns 404 if the execution’s workflow belongs to a different tenant.
 

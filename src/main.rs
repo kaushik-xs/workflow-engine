@@ -131,7 +131,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let app = Router::new()
         .route("/workflows", post(create_workflow).get(list_workflows))
-        .route("/workflows/:id", get(get_workflow).put(update_workflow))
+        .route("/workflows/:id", get(get_workflow).put(update_workflow).delete(delete_workflow))
         .route("/webhook/:id", post(trigger_webhook))
         .route("/executions", get(list_executions))
         .route("/executions/:id", get(get_execution))
@@ -293,6 +293,33 @@ async fn update_workflow(
         "definition": updated.definition,
         "created_at": updated.created_at.to_rfc3339(),
         "updated_at": updated.updated_at.to_rfc3339()
+    })))
+}
+
+async fn delete_workflow(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let w = storage::get_workflow_by_id(&state.pool, id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
+    if let Some(ref tenant) = tenant_from_headers(&headers) {
+        if w.tenant != *tenant {
+            return Err(AppError::NotFound("workflow not found".into()));
+        }
+    }
+    // Deleting the workflow cascades to its executions and their steps.
+    let deleted = storage::delete_workflow(&state.pool, id)
+        .await
+        .map_err(AppError::from)?;
+    if !deleted {
+        return Err(AppError::NotFound("workflow not found".into()));
+    }
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "deleted": true
     })))
 }
 

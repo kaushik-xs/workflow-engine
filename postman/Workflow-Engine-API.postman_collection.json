@@ -81,6 +81,17 @@
             "url": "{{base_url}}/workflows/{{workflow_id}}",
             "description": "Update workflow by id. Body: optional \"tenant\" (string, stored in workflow), optional \"definition\" (full React Flow JSON), optional \"is_latest\" (true to mark this workflow as the latest for its name). At least one field should be provided."
           }
+        },
+        {
+          "name": "Delete Workflow",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Optional. If set, returns 404 when workflow belongs to a different tenant." }
+            ],
+            "url": "{{base_url}}/workflows/{{workflow_id}}",
+            "description": "Delete a workflow by id. This also deletes all of the workflow's executions and their steps (ON DELETE CASCADE). Returns { id, deleted: true }, or 404 if the workflow does not exist (or belongs to a different tenant when X-Tenant-ID is set)."
+          }
         }
       ]
     },
