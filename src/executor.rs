@@ -177,6 +177,13 @@ async fn run_single_node(
             Ok((context, output))
         }
         Err(e) => {
+            tracing::error!(
+                execution_id = %execution_id,
+                node_id = %node.id,
+                node_type = %node.node_type,
+                error = %e,
+                "node execution failed"
+            );
             storage::update_execution(
                 pool,
                 execution_id,
