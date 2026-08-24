@@ -53,6 +53,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 - **HttpTrigger** – Entry point; Webhook context is set by the HTTP layer.
 - **HttpRequest** – Calls an external HTTP API (config: `method`, `url` or `path`, optional `body`/`headers`).
 - **ServiceCall** – Calls an internal service (config: `serviceSlug`, `operation`). Uses the registered service registry (stub `authrs` by default).
+- **WorkflowCall** – Runs another workflow as a nested execution and returns its response (config: `workflowId` or `workflow`/`workflowName` with optional `version`/`tenant`; payload via `rawBody`/`body`). Guarded against self-calls and cycles (max depth 10).
 
 ## Step-by-step execution (debug mode)
 

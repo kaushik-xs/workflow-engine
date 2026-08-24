@@ -1,14 +1,19 @@
 use crate::nodes::NodeExecutor;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use crate::nodes::{HttpRequestExecutor, HttpTriggerExecutor, MergeExecutor, ServiceCallExecutor};
+use crate::nodes::{
+    HttpRequestExecutor, HttpTriggerExecutor, MergeExecutor, ServiceCallExecutor,
+    WorkflowCallExecutor,
+};
 
 pub trait NodeRegistry: Send + Sync {
     fn get(&self, node_type: &str) -> Option<Arc<dyn NodeExecutor>>;
 }
 
-/// Default registry with HttpTrigger, HttpRequest, ServiceCall registered.
+/// Default registry with HttpTrigger, HttpRequest, Merge, ServiceCall registered.
+/// WorkflowCall needs a reference to the registry itself, so it is only wired up by
+/// [`DefaultNodeRegistry::new_arc`] (see below).
 pub struct DefaultNodeRegistry {
     map: HashMap<String, Arc<dyn NodeExecutor>>,
 }
@@ -25,6 +30,21 @@ impl DefaultNodeRegistry {
         };
         map.insert("ServiceCall".to_string(), service_call);
         Self { map }
+    }
+
+    /// Build the registry as an `Arc`, additionally wiring node types that need a
+    /// reference back to the registry itself — currently `WorkflowCall`, which
+    /// recursively executes other workflows through this same registry.
+    pub fn new_arc(pool: Arc<sqlx::PgPool>) -> Arc<Self> {
+        Arc::new_cyclic(|weak: &Weak<DefaultNodeRegistry>| {
+            let mut registry = DefaultNodeRegistry::new(Some(pool.clone()));
+            let weak_registry: Weak<dyn NodeRegistry> = weak.clone();
+            registry.register(
+                "WorkflowCall",
+                Arc::new(WorkflowCallExecutor::new(pool.clone(), weak_registry)),
+            );
+            registry
+        })
     }
 
     pub fn register(&mut self, node_type: &str, executor: Arc<dyn NodeExecutor>) {

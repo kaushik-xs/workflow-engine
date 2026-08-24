@@ -122,7 +122,7 @@ async fn main() -> Result<(), anyhow::Error> {
     sqlx::migrate!("./migrations").run(&pool).await?;
 
     let node_registry: Arc<dyn NodeRegistry> =
-        Arc::new(DefaultNodeRegistry::new(Some(Arc::new(pool.clone()))));
+        DefaultNodeRegistry::new_arc(Arc::new(pool.clone()));
 
     let state = AppState {
         pool: pool.clone(),
