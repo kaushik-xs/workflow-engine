@@ -87,8 +87,24 @@ impl NodeExecutor for ServiceCallExecutor {
         mut input: Value,
         mut config: Value,
     ) -> Result<Value, String> {
+        // Capture the raw body template before interpolation. Flat string interpolation would
+        // stringify a quoted whole-value placeholder (e.g. `"items": "{{ users[*]... }}"`) into
+        // `"[{...}]"`; JSON-aware interpolation injects the real array instead.
+        let raw_body_template = config
+            .get("rawBody")
+            .or_else(|| input.get("rawBody"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
+
         expression::interpolate_value(&mut input, &ctx.context)?;
         expression::interpolate_value(&mut config, &ctx.context)?;
+
+        if let Some(tpl) = raw_body_template {
+            let rendered = expression::interpolate_json_body(&tpl, &ctx.context)?;
+            if let Value::Object(map) = &mut config {
+                map.insert("rawBody".to_string(), Value::String(rendered));
+            }
+        }
 
         let apply_headers_and_body = |req: reqwest::RequestBuilder, config: &Value, input: &Value| {
             let body = config

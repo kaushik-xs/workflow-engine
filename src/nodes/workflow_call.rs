@@ -46,8 +46,22 @@ impl NodeExecutor for WorkflowCallExecutor {
         mut input: Value,
         mut config: Value,
     ) -> Result<Value, String> {
+        // Capture the raw body template before interpolation so JSON-aware substitution (below) can
+        // inject real arrays/objects for quoted whole-value placeholders instead of stringifying them.
+        let raw_body_template = config
+            .get("rawBody")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
+
         expression::interpolate_value(&mut input, &ctx.context)?;
         expression::interpolate_value(&mut config, &ctx.context)?;
+
+        if let Some(tpl) = raw_body_template {
+            let rendered = expression::interpolate_json_body(&tpl, &ctx.context)?;
+            if let Value::Object(map) = &mut config {
+                map.insert("rawBody".to_string(), Value::String(rendered));
+            }
+        }
 
         // Guard against runaway recursion (direct or indirect cycles).
         let depth = ctx

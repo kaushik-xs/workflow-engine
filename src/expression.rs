@@ -179,6 +179,23 @@ pub fn interpolate_value(value: &mut Value, context: &Value) -> Result<(), Strin
     Ok(())
 }
 
+/// Interpolate a raw JSON body template into a JSON string.
+///
+/// If `raw` parses as JSON on its own, typed substitution ([`interpolate_value`]) is applied to the
+/// parsed structure — so a quoted whole-value placeholder like `"items": "{{ expr }}"` injects a real
+/// array/object/number instead of a stringified copy — and the result is reserialized. If `raw` is
+/// not valid JSON before substitution (e.g. an unquoted `"count": {{ expr }}`), it falls back to flat
+/// string interpolation, which stringifies scalar results in place.
+pub fn interpolate_json_body(raw: &str, context: &Value) -> Result<String, String> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(mut v) => {
+            interpolate_value(&mut v, context)?;
+            serde_json::to_string(&v).map_err(|e| e.to_string())
+        }
+        Err(_) => interpolate_string(raw, context),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +320,40 @@ mod tests {
         assert_eq!(items[0]["variables"]["name"], "Sridhar");
         assert_eq!(items[1]["recipient"]["address"], "chandirasegaran.i+1@regere.ai");
         assert_eq!(items[1]["variables"]["name"], "Chandirasegaran");
+    }
+
+    #[test]
+    fn interpolate_json_body_injects_real_array_for_quoted_placeholder() {
+        // The exact message-flow/bulk case: a quoted whole-value placeholder must render as a real
+        // JSON array so the service receives a sequence, not a string containing `"[{...}]"`.
+        let ctx = serde_json::json!({
+            "current": { "body": { "users": [
+                { "email": "sridhar.r@regere.ai", "firstName": "Sridhar", "lastName": "R" },
+                { "email": "chandirasegaran.i+1@regere.ai", "firstName": "Chandirasegaran", "lastName": "Ilangovane" }
+            ] } }
+        });
+
+        let raw = r#"{ "items": "{{ current.body.users[*].{channel: 'email', recipient: {address: email}, template_code: 'milestone-open-intimation', variables: {name: join(' ', [firstName, lastName])}} }}" }"#;
+
+        let rendered = interpolate_json_body(raw, &ctx).unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+
+        let items = parsed["items"].as_array().expect("items must be a real array, not a string");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["channel"], "email");
+        assert_eq!(items[0]["recipient"]["address"], "sridhar.r@regere.ai");
+        assert_eq!(items[0]["variables"]["name"], "Sridhar R");
+        assert_eq!(items[1]["variables"]["name"], "Chandirasegaran Ilangovane");
+    }
+
+    #[test]
+    fn interpolate_json_body_falls_back_for_unquoted_scalar() {
+        // An unquoted placeholder is not valid JSON before substitution, so it falls back to string
+        // interpolation — which still yields valid JSON for scalar results.
+        let ctx = serde_json::json!({ "current": { "body": { "count": 7 } } });
+        let raw = r#"{ "count": {{ current.body.count }} }"#;
+        let rendered = interpolate_json_body(raw, &ctx).unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["count"], 7);
     }
 }
