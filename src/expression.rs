@@ -4,6 +4,8 @@
 //! (4) Evaluate against context (5) Replace value. Used in headers, body, path, etc. for all node types.
 //! Context shape: `{ "current": {}, "nodes": {}, "env": {} }` plus Webhook, etc.
 
+use jmespath::functions::{ArgumentType, CustomFunction, Signature};
+use jmespath::{ErrorReason, Rcvar, Runtime};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -13,8 +15,43 @@ use tracing;
 static COMPILED_CACHE: std::sync::OnceLock<Mutex<HashMap<String, jmespath::Expression<'static>>>> =
     std::sync::OnceLock::new();
 
-fn compiled_cache() -> &'static Mutex<HashMap<String, jmespath::Expression<'static>>> {
-    COMPILED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Runtime carrying the JMESPath built-ins plus our custom functions (e.g. `parse_json`).
+///
+/// `jmespath::compile` uses the crate's default runtime, which only knows the built-in functions.
+/// To expose custom functions we compile against this runtime instead. It is `'static`, so compiled
+/// expressions borrowing it are `Expression<'static>` and can be cached.
+static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+
+fn runtime() -> &'static Runtime {
+    RUNTIME.get_or_init(|| {
+        let mut rt = Runtime::new();
+        rt.register_builtin_functions();
+
+        // parse_json(string) -> value
+        // Parse a JSON-encoded string into a real value (object/array/number/bool/null/string).
+        // Useful when an incoming field holds JSON as text, e.g. `parse_json(Webhook.body.assignees)`
+        // to turn the string `"[\"id1\",\"id2\"]"` into an array before indexing.
+        rt.register_function(
+            "parse_json",
+            Box::new(CustomFunction::new(
+                Signature::new(vec![ArgumentType::String], None),
+                Box::new(|args: &[Rcvar], _ctx| {
+                    // Signature validation guarantees a single string argument.
+                    let raw = args[0].as_string().expect("validated as string");
+                    match jmespath::Variable::from_json(raw) {
+                        Ok(v) => Ok(Rcvar::new(v)),
+                        Err(e) => Err(jmespath::JmespathError::new(
+                            raw,
+                            0,
+                            ErrorReason::Parse(format!("parse_json: invalid JSON: {e}")),
+                        )),
+                    }
+                }),
+            )),
+        );
+
+        rt
+    })
 }
 
 /// Compile JMESPath expression, using cache on hit. Expressions are JMESPath-only (safe, no arbitrary code).
@@ -25,9 +62,13 @@ fn get_compiled(expr_str: &str) -> Result<jmespath::Expression<'static>, String>
     if let Some(expr) = guard.get(&key) {
         return Ok(expr.clone());
     }
-    let expr = jmespath::compile(expr_str).map_err(|e| e.to_string())?;
+    let expr = runtime().compile(expr_str).map_err(|e| e.to_string())?;
     guard.insert(key, expr.clone());
     Ok(expr)
+}
+
+fn compiled_cache() -> &'static Mutex<HashMap<String, jmespath::Expression<'static>>> {
+    COMPILED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Evaluate a single JMESPath expression against context (JSON value).
@@ -238,6 +279,43 @@ mod tests {
         assert_eq!(evaluate("current.status", &ctx).unwrap(), serde_json::json!("ok"));
         assert_eq!(evaluate("nodes.n1.price", &ctx).unwrap(), serde_json::json!(42));
         assert_eq!(evaluate("env.HOME", &ctx).unwrap(), serde_json::json!("/home"));
+    }
+
+    #[test]
+    fn parse_json_parses_string_to_typed_value() {
+        // A field holding a JSON array as text becomes a real array we can index into.
+        let ctx = serde_json::json!({
+            "Webhook": { "body": { "assignees": "[\"id-1\",\"id-2\"]" } }
+        });
+        assert_eq!(
+            evaluate("parse_json(Webhook.body.assignees)", &ctx).unwrap(),
+            serde_json::json!(["id-1", "id-2"])
+        );
+        assert_eq!(
+            evaluate("parse_json(Webhook.body.assignees)[0]", &ctx).unwrap(),
+            serde_json::json!("id-1")
+        );
+
+        // A field holding a JSON object as text, then projecting a member.
+        let ctx = serde_json::json!({
+            "Webhook": { "body": { "assignee": "{\"id\":\"abc\",\"name\":\"A\"}" } }
+        });
+        assert_eq!(
+            evaluate("parse_json(Webhook.body.assignee).id", &ctx).unwrap(),
+            serde_json::json!("abc")
+        );
+
+        // Usable inside an interpolated URL/query string.
+        assert_eq!(
+            interpolate_string("id=={{ parse_json(Webhook.body.assignee).id }}", &ctx).unwrap(),
+            "id==abc"
+        );
+    }
+
+    #[test]
+    fn parse_json_errors_on_malformed_input() {
+        let ctx = serde_json::json!({ "Webhook": { "body": { "assignees": "not json" } } });
+        assert!(evaluate("parse_json(Webhook.body.assignees)", &ctx).is_err());
     }
 
     #[test]
