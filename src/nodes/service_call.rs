@@ -7,6 +7,24 @@ use tracing;
 use crate::expression;
 use crate::storage;
 
+/// Resolve a node's `rawBody` into the string to send as the HTTP body.
+///
+/// `rawBody` is normally a template string. But the executor pre-interpolates the whole config
+/// before the node runs, and a `rawBody` that is a *sole* `{{ expr }}` gets replaced with the raw
+/// typed result — e.g. a JMESPath projection like `data[*].{...}` becomes a real JSON array/object,
+/// no longer a string. Treating only `Value::String` as a body would then send nothing. Serialize
+/// those typed values instead so the reshaped payload is sent as JSON. `null`/missing means no body.
+fn raw_body_string(config: &Value, input: &Value) -> Option<String> {
+    config
+        .get("rawBody")
+        .or_else(|| input.get("rawBody"))
+        .and_then(|v| match v {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        })
+}
+
 /// Build request log (method, url, headers, body) for steps/executions and tracing.
 fn request_log(
     method: &str,
@@ -18,11 +36,7 @@ fn request_log(
         .get("body")
         .cloned()
         .or_else(|| input.get("body").cloned());
-    let raw_body = config
-        .get("rawBody")
-        .or_else(|| input.get("rawBody"))
-        .and_then(Value::as_str)
-        .map(|s| s.to_string());
+    let raw_body = raw_body_string(config, input);
     let body_for_log: Value = raw_body
         .map(Value::String)
         .or(body)
@@ -111,11 +125,7 @@ impl NodeExecutor for ServiceCallExecutor {
                 .get("body")
                 .cloned()
                 .or_else(|| input.get("body").cloned());
-            let raw_body = config
-                .get("rawBody")
-                .or_else(|| input.get("rawBody"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string());
+            let raw_body = raw_body_string(config, input);
 
             let mut headers = input
                 .get("headers")
@@ -273,5 +283,51 @@ impl NodeExecutor for ServiceCallExecutor {
             "body": body_value,
             "request": request
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn raw_body_string_passes_through_a_plain_string() {
+        let config = json!({ "rawBody": "{\"a\":1}" });
+        let input = json!({});
+        assert_eq!(raw_body_string(&config, &input).as_deref(), Some("{\"a\":1}"));
+    }
+
+    #[test]
+    fn raw_body_string_serializes_pre_interpolated_array() {
+        // The bug: the executor pre-interpolates a sole `{{ data[*].{...} }}` rawBody into a real
+        // JSON array, so it is no longer a string. It must still be sent as a JSON array body.
+        let config = json!({ "rawBody": [ { "order": 1 }, { "order": 2 } ] });
+        let input = json!({});
+        let sent = raw_body_string(&config, &input).expect("array rawBody must produce a body");
+        let parsed: Value = serde_json::from_str(&sent).unwrap();
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert_eq!(parsed[0]["order"], 1);
+    }
+
+    #[test]
+    fn raw_body_string_serializes_pre_interpolated_object() {
+        let config = json!({ "rawBody": { "projectId": "p1" } });
+        let sent = raw_body_string(&config, &json!({})).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&sent).unwrap()["projectId"], "p1");
+    }
+
+    #[test]
+    fn raw_body_string_is_none_for_null_or_missing() {
+        assert_eq!(raw_body_string(&json!({ "rawBody": null }), &json!({})), None);
+        assert_eq!(raw_body_string(&json!({}), &json!({})), None);
+    }
+
+    #[test]
+    fn raw_body_string_falls_back_to_input() {
+        let config = json!({});
+        let input = json!({ "rawBody": "[]" });
+        assert_eq!(raw_body_string(&config, &input).as_deref(), Some("[]"));
     }
 }
