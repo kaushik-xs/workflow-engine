@@ -85,21 +85,63 @@ fn topological_order(node_specs: &[NodeSpec], edges: &[crate::definition::EdgeSp
     order
 }
 
-/// Ensures context has nodes, env, and current so expressions can safely reference them.
+/// Ensures context has `nodes`, `current`, `global`, and `local` so expressions can
+/// safely reference them. Existing values are never overwritten — `global` and `local`
+/// are populated once at execution start (see [`build_initial_context`]) and persisted
+/// in the execution context; this only backfills missing keys defensively.
+///
+/// The OS environment is intentionally NOT exposed. Use tenant-scoped `global` values
+/// and workflow-scoped `local` variables instead.
 fn ensure_context_shape(context: &mut Value) {
     if let Some(obj) = context.as_object_mut() {
         obj.entry("nodes")
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         obj.entry("current")
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        obj.entry("env").or_insert_with(|| {
-            let mut env = serde_json::Map::new();
-            for (k, v) in std::env::vars() {
-                env.insert(k, Value::String(v));
-            }
-            Value::Object(env)
-        });
+        obj.entry("global")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        obj.entry("local")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
     }
+}
+
+/// Build the persisted initial context for a new execution.
+///
+/// Starts from `base` (typically `{ "Webhook": {...} }`, plus internals like
+/// `workflowCallDepth`), then:
+///   1. loads the tenant's `global` key/value store (snapshotted into the context), and
+///   2. seeds `local` from the workflow's declared variables — interpolating each default
+///      against a context that already exposes `Webhook` and `global`.
+///
+/// The result is stored on the execution row, so step-mode runs and `SetVariable`
+/// mutations read and update a single, stable `local` scope across steps.
+pub async fn build_initial_context(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    definition: &Value,
+    base: Value,
+) -> Result<Value, String> {
+    let mut context = base;
+    if !context.is_object() {
+        context = Value::Object(serde_json::Map::new());
+    }
+
+    let globals = storage::get_globals_map(pool, tenant)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("global".to_string(), globals);
+    }
+    ensure_context_shape(&mut context);
+
+    // Seed `local` by interpolating declared variable defaults against Webhook + global.
+    let mut variables = definition::parse_variables(definition);
+    expression::interpolate_value(&mut variables, &context)?;
+    if let (Some(obj), Value::Object(vars)) = (context.as_object_mut(), variables) {
+        obj.insert("local".to_string(), Value::Object(vars));
+    }
+
+    Ok(context)
 }
 
 /// Result of running one step (for step-by-step mode).
@@ -166,6 +208,13 @@ async fn run_single_node(
                 output = ?output,
                 "node executed successfully"
             );
+            // A SetVariable node returns an object of variables to write into the `local`
+            // scope; merge them so subsequent nodes (and later steps) see the updates.
+            if node.node_type == "SetVariable" {
+                if let Value::Object(vars) = &output {
+                    merge_into_local(&mut exec_ctx.context, vars);
+                }
+            }
             exec_ctx.set_node_output(&node.id, output.clone());
             let context = exec_ctx.context;
             storage::update_execution(pool, execution_id, "running", &context, None)
@@ -203,6 +252,22 @@ async fn run_single_node(
             )
             .await;
             Err(e)
+        }
+    }
+}
+
+/// Merge a set of variables into the context's `local` scope, creating it if absent.
+fn merge_into_local(context: &mut Value, vars: &serde_json::Map<String, Value>) {
+    if !context.is_object() {
+        *context = Value::Object(serde_json::Map::new());
+    }
+    let obj = context.as_object_mut().unwrap();
+    let local = obj
+        .entry("local")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(local_obj) = local.as_object_mut() {
+        for (k, v) in vars {
+            local_obj.insert(k.clone(), v.clone());
         }
     }
 }
@@ -420,4 +485,52 @@ pub async fn run_next_step(
         status: status.to_string(),
         context: new_context,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_context_shape_adds_scopes_but_no_env() {
+        let mut ctx = serde_json::json!({});
+        ensure_context_shape(&mut ctx);
+        assert_eq!(ctx["nodes"], serde_json::json!({}));
+        assert_eq!(ctx["current"], serde_json::json!({}));
+        assert_eq!(ctx["global"], serde_json::json!({}));
+        assert_eq!(ctx["local"], serde_json::json!({}));
+        // The OS environment must never be exposed to workflows.
+        assert!(ctx.get("env").is_none());
+    }
+
+    #[test]
+    fn ensure_context_shape_preserves_existing_scopes() {
+        let mut ctx = serde_json::json!({
+            "global": { "A": 1 },
+            "local": { "counter": 5 }
+        });
+        ensure_context_shape(&mut ctx);
+        assert_eq!(ctx["global"]["A"], 1);
+        assert_eq!(ctx["local"]["counter"], 5);
+    }
+
+    #[test]
+    fn merge_into_local_adds_and_overwrites() {
+        let mut ctx = serde_json::json!({ "local": { "a": 1, "b": 2 } });
+        let vars: serde_json::Map<String, Value> =
+            serde_json::from_value(serde_json::json!({ "b": 20, "c": 3 })).unwrap();
+        merge_into_local(&mut ctx, &vars);
+        assert_eq!(ctx["local"]["a"], 1); // untouched
+        assert_eq!(ctx["local"]["b"], 20); // overwritten
+        assert_eq!(ctx["local"]["c"], 3); // added
+    }
+
+    #[test]
+    fn merge_into_local_creates_local_when_absent() {
+        let mut ctx = serde_json::json!({});
+        let vars: serde_json::Map<String, Value> =
+            serde_json::from_value(serde_json::json!({ "x": true })).unwrap();
+        merge_into_local(&mut ctx, &vars);
+        assert_eq!(ctx["local"]["x"], true);
+    }
 }

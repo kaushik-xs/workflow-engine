@@ -133,6 +133,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .route("/workflows", post(create_workflow).get(list_workflows))
         .route("/workflows/:id", get(get_workflow).put(update_workflow).delete(delete_workflow))
         .route("/webhook/:id", post(trigger_webhook))
+        .route("/globals", get(list_globals).put(set_global))
+        .route("/globals/:key", get(get_global).put(set_global_by_key).delete(delete_global))
         .route("/executions", get(list_executions))
         .route("/executions/:id", get(get_execution))
         .route("/executions/:id/step", post(run_next_step_handler))
@@ -366,7 +368,17 @@ async fn trigger_webhook(
         }
     }
 
-    let initial_context = triggers::webhook_context_from_request(body, &headers);
+    let webhook_context = triggers::webhook_context_from_request(body, &headers);
+    // Snapshot the tenant's globals and seed the workflow's declared local variables into
+    // the persisted execution context (used by both immediate and step-mode runs).
+    let initial_context = executor::build_initial_context(
+        &state.pool,
+        &workflow.tenant,
+        &workflow.definition,
+        webhook_context,
+    )
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
     let step_mode = query.step == Some(true);
     let initial_status = if step_mode { Some("paused") } else { None };
     let exec = storage::create_execution(
@@ -421,6 +433,105 @@ async fn trigger_webhook(
         result: result_body,
         error,
     }))
+}
+
+fn require_tenant(headers: &axum::http::HeaderMap) -> Result<String, AppError> {
+    tenant_from_headers(headers)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("tenant is required (X-Tenant-ID header)".into()))
+}
+
+fn global_json(g: storage::WorkflowGlobal) -> serde_json::Value {
+    serde_json::json!({
+        "key": g.key,
+        "value": g.value,
+        "created_at": g.created_at.to_rfc3339(),
+        "updated_at": g.updated_at.to_rfc3339(),
+    })
+}
+
+async fn list_globals(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let rows = storage::list_globals(&state.pool, &tenant)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!({
+        "globals": rows.into_iter().map(global_json).collect::<Vec<_>>(),
+    })))
+}
+
+async fn get_global(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let g = storage::get_global(&state.pool, &tenant, &key)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::NotFound("global not found".into()))?;
+    Ok(Json(global_json(g)))
+}
+
+/// PUT /globals with body `{ "key": "...", "value": <any> }`.
+async fn set_global(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let tenant = require_tenant(&headers)?;
+    let key = body
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("key is required".into()))?
+        .to_string();
+    let value = body
+        .get("value")
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("value is required".into()))?;
+    let g = storage::set_global(&state.pool, &tenant, &key, &value)
+        .await
+        .map_err(AppError::from)?;
+    Ok((StatusCode::OK, Json(global_json(g))))
+}
+
+/// PUT /globals/:key — body is either the raw value or `{ "value": <any> }`.
+async fn set_global_by_key(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(key): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let tenant = require_tenant(&headers)?;
+    // Accept `{ "value": ... }` wrapper, or treat the whole body as the value.
+    let value = match body.get("value") {
+        Some(v) => v.clone(),
+        None => body,
+    };
+    let g = storage::set_global(&state.pool, &tenant, &key, &value)
+        .await
+        .map_err(AppError::from)?;
+    Ok((StatusCode::OK, Json(global_json(g))))
+}
+
+async fn delete_global(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let deleted = storage::delete_global(&state.pool, &tenant, &key)
+        .await
+        .map_err(AppError::from)?;
+    if !deleted {
+        return Err(AppError::NotFound("global not found".into()));
+    }
+    Ok(Json(serde_json::json!({ "key": key, "deleted": true })))
 }
 
 async fn list_executions(

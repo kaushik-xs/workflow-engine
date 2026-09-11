@@ -14,6 +14,15 @@ pub struct ServiceRegistryRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct WorkflowGlobal {
+    pub tenant: String,
+    pub key: String,
+    pub value: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Workflow {
     pub id: Uuid,
     pub tenant: String,
@@ -429,6 +438,97 @@ pub async fn list_steps_by_execution(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// List all globals for a tenant, most recently updated first.
+pub async fn list_globals(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+) -> Result<Vec<WorkflowGlobal>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, WorkflowGlobal>(
+        r#"
+        SELECT tenant, key, value, created_at, updated_at
+        FROM workflow_globals
+        WHERE tenant = $1
+        ORDER BY key ASC
+        "#,
+    )
+    .bind(tenant)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Fetch a single global by tenant + key.
+pub async fn get_global(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    key: &str,
+) -> Result<Option<WorkflowGlobal>, sqlx::Error> {
+    let row = sqlx::query_as::<_, WorkflowGlobal>(
+        r#"
+        SELECT tenant, key, value, created_at, updated_at
+        FROM workflow_globals
+        WHERE tenant = $1 AND key = $2
+        "#,
+    )
+    .bind(tenant)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Return a tenant's globals as a single JSON object `{ key: value, ... }`,
+/// ready to inject into an execution context under `global`.
+pub async fn get_globals_map(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let rows = list_globals(pool, tenant).await?;
+    let mut map = serde_json::Map::new();
+    for row in rows {
+        map.insert(row.key, row.value);
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+/// Upsert a global value for a tenant + key.
+pub async fn set_global(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<WorkflowGlobal, sqlx::Error> {
+    let row = sqlx::query_as::<_, WorkflowGlobal>(
+        r#"
+        INSERT INTO workflow_globals (tenant, key, value)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (tenant, key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = now()
+        RETURNING tenant, key, value, created_at, updated_at
+        "#,
+    )
+    .bind(tenant)
+    .bind(key)
+    .bind(value)
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Delete a global. Returns true if a row was removed.
+pub async fn delete_global(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    key: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(r#"DELETE FROM workflow_globals WHERE tenant = $1 AND key = $2"#)
+        .bind(tenant)
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn get_service_by_slug(

@@ -2,7 +2,7 @@
 //!
 //! Execution: (1) Detect `{{ }}` (2) Extract expression (3) Compile JMESPath with cache
 //! (4) Evaluate against context (5) Replace value. Used in headers, body, path, etc. for all node types.
-//! Context shape: `{ "current": {}, "nodes": {}, "env": {} }` plus Webhook, etc.
+//! Context shape: `{ "current": {}, "nodes": {}, "global": {}, "local": {} }` plus Webhook, etc.
 
 use jmespath::functions::{ArgumentType, CustomFunction, Signature};
 use jmespath::{ErrorReason, Rcvar, Runtime};
@@ -274,11 +274,13 @@ mod tests {
         let ctx = serde_json::json!({
             "current": { "status": "ok" },
             "nodes": { "n1": { "price": 42 } },
-            "env": { "HOME": "/home" }
+            "global": { "API_BASE": "https://api.example.com" },
+            "local": { "counter": 3 }
         });
         assert_eq!(evaluate("current.status", &ctx).unwrap(), serde_json::json!("ok"));
         assert_eq!(evaluate("nodes.n1.price", &ctx).unwrap(), serde_json::json!(42));
-        assert_eq!(evaluate("env.HOME", &ctx).unwrap(), serde_json::json!("/home"));
+        assert_eq!(evaluate("global.API_BASE", &ctx).unwrap(), serde_json::json!("https://api.example.com"));
+        assert_eq!(evaluate("local.counter", &ctx).unwrap(), serde_json::json!(3));
     }
 
     #[test]

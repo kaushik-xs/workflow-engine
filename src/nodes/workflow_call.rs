@@ -151,10 +151,18 @@ impl NodeExecutor for WorkflowCallExecutor {
             "body": body.clone()
         });
 
-        let initial_context = serde_json::json!({
-            "Webhook": { "body": body, "headers": headers },
-            "workflowCallDepth": depth
-        });
+        // Snapshot the sub-workflow tenant's globals and seed its declared local variables,
+        // preserving the recursion-guard depth we carry across calls.
+        let initial_context = executor::build_initial_context(
+            self.pool.as_ref(),
+            &workflow.tenant,
+            &workflow.definition,
+            serde_json::json!({
+                "Webhook": { "body": body, "headers": headers },
+                "workflowCallDepth": depth
+            }),
+        )
+        .await?;
 
         let registry = self
             .registry

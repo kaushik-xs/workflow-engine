@@ -41,6 +41,11 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 | POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name; optional `?step=true` for step-by-step (debug) mode. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
 | GET | /executions/:id | Get execution (includes `workflow_version` that was run) |
 | POST | /executions/:id/step | Run the next step for a paused execution (step-by-step mode). Returns the execution with updated status and steps. |
+| GET | /globals | List the tenant's globals (requires **X-Tenant-ID**). Returns `{ "globals": [{ "key", "value", "created_at", "updated_at" }] }`. |
+| PUT | /globals | Upsert a global (requires **X-Tenant-ID**; body `{ "key", "value" }`; `value` is any JSON). |
+| GET | /globals/:key | Get one global by key (requires **X-Tenant-ID**). |
+| PUT | /globals/:key | Upsert a global by key (requires **X-Tenant-ID**; body is the raw value, or `{ "value": ... }`). |
+| DELETE | /globals/:key | Delete a global (requires **X-Tenant-ID**). Returns `{ "key", "deleted": true }`. |
 
 ## Versioning and latest
 
@@ -55,6 +60,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 - **HttpRequest** – Calls an external HTTP API (config: `method`, `url` or `path`, optional `body`/`headers`).
 - **ServiceCall** – Calls an internal service (config: `serviceSlug`, `operation`). Uses the registered service registry (stub `authrs` by default).
 - **WorkflowCall** – Runs another workflow as a nested execution and returns its response (config: `workflowId` or `workflow`/`workflowName` with optional `version`/`tenant`; payload via `rawBody`/`body`). Guarded against self-calls and cycles (max depth 10).
+- **SetVariable** – Writes into the workflow's `local` scope during execution (config: `variables` object, or a single `key`/`value`; values support `{{ }}`). Updated `{{ local.* }}` values are visible to downstream nodes and later steps.
 
 ## Step-by-step execution (debug mode)
 
@@ -71,6 +77,32 @@ If you call **Run next step** when the execution is not `paused` (e.g. already c
 ## Expressions
 
 Node inputs support `{{ JMESPath }}` expressions evaluated against the execution context (e.g. `{{ Webhook.body.customer_name }}`, `{{ nodes.some_node_id.body }}`).
+
+The execution context exposes these roots:
+
+- `Webhook` – the trigger request (`body`, `headers`).
+- `nodes.<node_id>` – each completed node's output.
+- `current` – the previous node's output.
+- `global` – the tenant's stored globals (see the `/globals` API), snapshotted at execution start. Reference as `{{ global.API_BASE }}`.
+- `local` – workflow-scoped variables. Reference as `{{ local.counter }}`.
+
+> The OS environment is **not** exposed to workflows. Anything that was previously read from `env` should be stored as a `global` (managed per tenant) or a `local` variable.
+
+### Global scope
+
+Globals are a per-tenant key/value store managed through the `/globals` API (values are any JSON). Every execution for that tenant sees the same values under `global.*`, captured as a snapshot when the execution is created.
+
+### Local scope
+
+Local variables are scoped to a single execution:
+
+- **Declare defaults in the workflow definition** under `data.variables` (or top-level `variables`). Each value may use `{{ }}` and is interpolated against `Webhook` and `global` at execution start to seed `local.*`:
+
+  ```json
+  { "data": { "variables": { "attempts": 0, "customer": "{{ Webhook.body.customer_name }}" }, "nodes": [], "edges": [] } }
+  ```
+
+- **Mutate at runtime** with a `SetVariable` node. Its `variables` (or `key`/`value`) are merged into `local`, so later nodes and steps read the updated values.
 
 ## Docker
 

@@ -47,6 +47,22 @@ pub fn parse_workflow(definition: &Value) -> Result<(Vec<NodeSpec>, Vec<EdgeSpec
     Ok((node_specs, edge_specs))
 }
 
+/// Extract the workflow's declared local variables (an object of `key -> default value`).
+///
+/// Looked up at `data.variables` first, then top-level `variables`. Values may contain
+/// `{{ }}` expressions; they are interpolated at execution start (against `Webhook` and
+/// `global`) to seed the `local` scope. Returns an empty object when none are declared.
+pub fn parse_variables(definition: &Value) -> Value {
+    let vars = definition
+        .get("data")
+        .and_then(|d| d.get("variables"))
+        .or_else(|| definition.get("variables"));
+    match vars {
+        Some(v) if v.is_object() => v.clone(),
+        _ => Value::Object(serde_json::Map::new()),
+    }
+}
+
 fn get_nodes_and_edges(definition: &Value) -> Result<(&Value, &Value), String> {
     if let Some(data) = definition.get("data") {
         let nodes = data.get("nodes").ok_or("data.nodes required")?;
@@ -98,4 +114,36 @@ pub fn to_pascal_case(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_variables_reads_data_variables() {
+        let def = serde_json::json!({
+            "data": { "nodes": [], "edges": [], "variables": { "retries": 3, "greeting": "hi" } }
+        });
+        let vars = parse_variables(&def);
+        assert_eq!(vars["retries"], 3);
+        assert_eq!(vars["greeting"], "hi");
+    }
+
+    #[test]
+    fn parse_variables_reads_top_level_variables() {
+        let def = serde_json::json!({
+            "nodes": [], "edges": [], "variables": { "flag": true }
+        });
+        assert_eq!(parse_variables(&def)["flag"], true);
+    }
+
+    #[test]
+    fn parse_variables_defaults_to_empty_object() {
+        let def = serde_json::json!({ "data": { "nodes": [], "edges": [] } });
+        assert_eq!(parse_variables(&def), serde_json::json!({}));
+        // Non-object variables are ignored.
+        let def = serde_json::json!({ "variables": "nope" });
+        assert_eq!(parse_variables(&def), serde_json::json!({}));
+    }
 }

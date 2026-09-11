@@ -4,14 +4,14 @@ use std::sync::{Arc, Weak};
 
 use crate::nodes::{
     HttpRequestExecutor, HttpTriggerExecutor, MergeExecutor, ServiceCallExecutor,
-    WorkflowCallExecutor,
+    SetVariableExecutor, WorkflowCallExecutor,
 };
 
 pub trait NodeRegistry: Send + Sync {
     fn get(&self, node_type: &str) -> Option<Arc<dyn NodeExecutor>>;
 }
 
-/// Default registry with HttpTrigger, HttpRequest, Merge, ServiceCall registered.
+/// Default registry with HttpTrigger, HttpRequest, Merge, ServiceCall, SetVariable registered.
 /// WorkflowCall needs a reference to the registry itself, so it is only wired up by
 /// [`DefaultNodeRegistry::new_arc`] (see below).
 pub struct DefaultNodeRegistry {
@@ -29,6 +29,7 @@ impl DefaultNodeRegistry {
             None => Arc::new(ServiceCallExecutor::default()),
         };
         map.insert("ServiceCall".to_string(), service_call);
+        map.insert("SetVariable".to_string(), Arc::new(SetVariableExecutor));
         Self { map }
     }
 
