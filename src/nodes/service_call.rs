@@ -130,8 +130,8 @@ impl NodeExecutor for ServiceCallExecutor {
             let mut headers = input
                 .get("headers")
                 .and_then(Value::as_object)
-                .map(|m| m.clone())
-                .unwrap_or_else(serde_json::Map::new);
+                .cloned()
+                .unwrap_or_default();
             if let Some(config_headers) = config.get("headers").and_then(Value::as_object) {
                 for (k, v) in config_headers {
                     headers.insert(k.clone(), v.clone());
