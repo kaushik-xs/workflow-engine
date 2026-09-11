@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use crate::nodes::{
-    HttpRequestExecutor, HttpTriggerExecutor, MergeExecutor, ServiceCallExecutor,
-    SetVariableExecutor, WorkflowCallExecutor,
+    HttpRequestExecutor, HttpTriggerExecutor, IfExecutor, MergeExecutor, ServiceCallExecutor,
+    SetVariableExecutor, SwitchExecutor, WorkflowCallExecutor,
 };
 
 pub trait NodeRegistry: Send + Sync {
@@ -24,6 +24,8 @@ impl DefaultNodeRegistry {
         map.insert("HttpTrigger".to_string(), Arc::new(HttpTriggerExecutor));
         map.insert("HttpRequest".to_string(), Arc::new(HttpRequestExecutor::default()));
         map.insert("Merge".to_string(), Arc::new(MergeExecutor));
+        map.insert("If".to_string(), Arc::new(IfExecutor));
+        map.insert("Switch".to_string(), Arc::new(SwitchExecutor));
         let service_call: Arc<dyn NodeExecutor> = match pool {
             Some(p) => Arc::new(ServiceCallExecutor::new(p)),
             None => Arc::new(ServiceCallExecutor::default()),

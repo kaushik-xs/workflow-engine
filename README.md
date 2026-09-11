@@ -61,6 +61,21 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 - **ServiceCall** – Calls an internal service (config: `serviceSlug`, `operation`). Uses the registered service registry (stub `authrs` by default).
 - **WorkflowCall** – Runs another workflow as a nested execution and returns its response (config: `workflowId` or `workflow`/`workflowName` with optional `version`/`tenant`; payload via `rawBody`/`body`). Guarded against self-calls and cycles (max depth 10).
 - **SetVariable** – Writes into the workflow's `local` scope during execution (config: `variables` object, or a single `key`/`value`; values support `{{ }}`). Updated `{{ local.* }}` values are visible to downstream nodes and later steps.
+- **If** – Two-way conditional branch. Evaluates one condition and activates the `true` or `false` output port (config: `condition` as `{ left, operator, right }` or any truthy value, or top-level `left`/`operator`/`right`; optional `trueHandle`/`falseHandle` port labels).
+- **Switch** – Multi-way conditional branch over a `value` (config: `cases` array of `{ handle, value }` / `{ handle, operator, value }` / `{ handle, condition }`; `mode` `"first"` (default) or `"all"`; `default` handle when nothing matches).
+
+### Branching
+
+`If` and `Switch` route the flow by activating only the output port(s) they select. Connect
+their outgoing edges from the matching **source handle** (`true`/`false`, or a Switch case
+label). At runtime, a node is executed only if it is reachable through an active edge;
+nodes that sit only on a branch that was not taken are recorded as **`skipped`** (a
+`workflow_steps` row with `status = "skipped"`, no output), and skipping cascades to
+everything downstream of them. A join reached from either branch (e.g. via a `Merge`) still
+runs. Supported operators: `eq`/`ne`, `gt`/`gte`/`lt`/`lte`, `contains`/`notContains`,
+`in`/`notIn`, `startsWith`/`endsWith`, `exists`/`empty` (comparisons coerce numeric strings;
+`{{ }}` expressions in the condition are interpolated before evaluation). Loops/cycles are
+not supported — workflows are DAGs.
 
 ## Step-by-step execution (debug mode)
 
