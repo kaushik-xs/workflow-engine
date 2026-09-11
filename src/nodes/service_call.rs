@@ -26,21 +26,13 @@ fn raw_body_string(config: &Value, input: &Value) -> Option<String> {
 }
 
 /// Build request log (method, url, headers, body) for steps/executions and tracing.
-fn request_log(
-    method: &str,
-    url: &str,
-    config: &Value,
-    input: &Value,
-) -> Value {
+fn request_log(method: &str, url: &str, config: &Value, input: &Value) -> Value {
     let body = config
         .get("body")
         .cloned()
         .or_else(|| input.get("body").cloned());
     let raw_body = raw_body_string(config, input);
-    let body_for_log: Value = raw_body
-        .map(Value::String)
-        .or(body)
-        .unwrap_or(Value::Null);
+    let body_for_log: Value = raw_body.map(Value::String).or(body).unwrap_or(Value::Null);
 
     let mut headers = input
         .get("headers")
@@ -120,39 +112,40 @@ impl NodeExecutor for ServiceCallExecutor {
             }
         }
 
-        let apply_headers_and_body = |req: reqwest::RequestBuilder, config: &Value, input: &Value| {
-            let body = config
-                .get("body")
-                .cloned()
-                .or_else(|| input.get("body").cloned());
-            let raw_body = raw_body_string(config, input);
+        let apply_headers_and_body =
+            |req: reqwest::RequestBuilder, config: &Value, input: &Value| {
+                let body = config
+                    .get("body")
+                    .cloned()
+                    .or_else(|| input.get("body").cloned());
+                let raw_body = raw_body_string(config, input);
 
-            let mut headers = input
-                .get("headers")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(config_headers) = config.get("headers").and_then(Value::as_object) {
-                for (k, v) in config_headers {
-                    headers.insert(k.clone(), v.clone());
+                let mut headers = input
+                    .get("headers")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(config_headers) = config.get("headers").and_then(Value::as_object) {
+                    for (k, v) in config_headers {
+                        headers.insert(k.clone(), v.clone());
+                    }
                 }
-            }
 
-            let mut req = req;
-            if let Some(ref raw) = raw_body {
-                req = req.body(raw.clone());
-            } else if let Some(ref b) = body {
-                if *b != Value::Null {
-                    req = req.json(b);
+                let mut req = req;
+                if let Some(ref raw) = raw_body {
+                    req = req.body(raw.clone());
+                } else if let Some(ref b) = body {
+                    if *b != Value::Null {
+                        req = req.json(b);
+                    }
                 }
-            }
-            for (k, v) in &headers {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k.as_str(), s);
+                for (k, v) in &headers {
+                    if let Some(s) = v.as_str() {
+                        req = req.header(k.as_str(), s);
+                    }
                 }
-            }
-            req
-        };
+                req
+            };
 
         if let Some(url_val) = config.get("url").and_then(|v| v.as_str()) {
             let method = config
@@ -185,9 +178,8 @@ impl NodeExecutor for ServiceCallExecutor {
             let resp = req.send().await.map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
             let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-            let body_value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-                Value::String(String::from_utf8_lossy(&bytes).into_owned())
-            });
+            let body_value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
 
             tracing::debug!(
                 execution_id = %ctx.execution_id,
@@ -226,7 +218,9 @@ impl NodeExecutor for ServiceCallExecutor {
             .and_then(Value::as_str)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .ok_or("ServiceCall config must have path (or operation/name) when using serviceSlug")?;
+            .ok_or(
+                "ServiceCall config must have path (or operation/name) when using serviceSlug",
+            )?;
         let path = if path_from_node.starts_with('/') {
             path_from_node
         } else {
@@ -266,9 +260,8 @@ impl NodeExecutor for ServiceCallExecutor {
         let resp = req.send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-        let body_value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-            Value::String(String::from_utf8_lossy(&bytes).into_owned())
-        });
+        let body_value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
 
         tracing::debug!(
             execution_id = %ctx.execution_id,
@@ -295,7 +288,10 @@ mod tests {
     fn raw_body_string_passes_through_a_plain_string() {
         let config = json!({ "rawBody": "{\"a\":1}" });
         let input = json!({});
-        assert_eq!(raw_body_string(&config, &input).as_deref(), Some("{\"a\":1}"));
+        assert_eq!(
+            raw_body_string(&config, &input).as_deref(),
+            Some("{\"a\":1}")
+        );
     }
 
     #[test]
@@ -315,12 +311,18 @@ mod tests {
     fn raw_body_string_serializes_pre_interpolated_object() {
         let config = json!({ "rawBody": { "projectId": "p1" } });
         let sent = raw_body_string(&config, &json!({})).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&sent).unwrap()["projectId"], "p1");
+        assert_eq!(
+            serde_json::from_str::<Value>(&sent).unwrap()["projectId"],
+            "p1"
+        );
     }
 
     #[test]
     fn raw_body_string_is_none_for_null_or_missing() {
-        assert_eq!(raw_body_string(&json!({ "rawBody": null }), &json!({})), None);
+        assert_eq!(
+            raw_body_string(&json!({ "rawBody": null }), &json!({})),
+            None
+        );
         assert_eq!(raw_body_string(&json!({}), &json!({})), None);
     }
 
