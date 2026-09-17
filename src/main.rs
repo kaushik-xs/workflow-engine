@@ -4,6 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::Utc;
 use serde::Serialize;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -79,6 +80,12 @@ struct ExecutionListItem {
 #[derive(Serialize)]
 struct ExecutionListResponse {
     executions: Vec<ExecutionListItem>,
+    /// Total executions matching the filters, ignoring limit/offset.
+    total: i64,
+    /// Page size that was applied (after clamping).
+    limit: i64,
+    /// Offset that was applied.
+    offset: i64,
 }
 
 #[derive(Serialize)]
@@ -336,9 +343,22 @@ struct WebhookQuery {
     step: Option<bool>,
 }
 
+/// Maximum number of executions returnable in a single page.
+const EXECUTIONS_MAX_LIMIT: i64 = 500;
+/// Default page size when the caller does not specify `limit`.
+const EXECUTIONS_DEFAULT_LIMIT: i64 = 100;
+
 #[derive(serde::Deserialize, Default)]
 struct ExecutionsQuery {
     workflow_id: Option<Uuid>,
+    /// Only executions started within the past N minutes. Absent or 0 = all time.
+    /// Matches the builder execution tab's time-range dropdown (5, 10, 15, 30,
+    /// 60, 120, 180, 360, 1440).
+    last_minutes: Option<i64>,
+    /// Page size. Defaults to 100, clamped to [1, 500].
+    limit: Option<i64>,
+    /// Rows to skip for pagination. Defaults to 0.
+    offset: Option<i64>,
 }
 
 async fn trigger_webhook(
@@ -550,17 +570,31 @@ async fn list_executions(
 ) -> Result<Json<ExecutionListResponse>, AppError> {
     let tenant_header = tenant_from_headers(&headers);
     let tenant = tenant_header.as_deref();
-    let limit = 100_i64;
-    let offset = 0_i64;
+
+    let limit = query
+        .limit
+        .unwrap_or(EXECUTIONS_DEFAULT_LIMIT)
+        .clamp(1, EXECUTIONS_MAX_LIMIT);
+    let offset = query.offset.unwrap_or(0).max(0);
+    // A positive `last_minutes` becomes a lower bound on started_at; 0/absent = all time.
+    let since = match query.last_minutes {
+        Some(m) if m > 0 => Some(Utc::now() - chrono::Duration::minutes(m)),
+        _ => None,
+    };
+
     let rows = storage::list_executions(
         &state.pool,
         query.workflow_id,
         tenant,
+        since,
         limit,
         offset,
     )
     .await
     .map_err(AppError::from)?;
+    let total = storage::count_executions(&state.pool, query.workflow_id, tenant, since)
+        .await
+        .map_err(AppError::from)?;
     Ok(Json(ExecutionListResponse {
         executions: rows
             .into_iter()
@@ -574,6 +608,9 @@ async fn list_executions(
                 finished_at: e.finished_at.map(|t| t.to_rfc3339()),
             })
             .collect(),
+        total,
+        limit,
+        offset,
     }))
 }
 

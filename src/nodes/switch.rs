@@ -78,16 +78,28 @@ impl NodeExecutor for SwitchExecutor {
         let all_mode = config.get("mode").and_then(Value::as_str) == Some("all");
 
         let mut matched: Vec<String> = Vec::new();
+        // Per-case outcome, so the trace shows which cases were tested and which hit.
+        let mut evaluated: Vec<Value> = Vec::with_capacity(cases.len());
+        let mut stopped = false;
         for (i, case) in cases.iter().enumerate() {
-            if case_matches(case, &value)? {
-                matched.push(case_handle(case, i));
+            let handle = case_handle(case, i);
+            if stopped {
+                evaluated.push(json!({ "handle": handle, "matched": false, "tested": false }));
+                continue;
+            }
+            let is_match = case_matches(case, &value)?;
+            evaluated.push(json!({ "handle": handle.clone(), "matched": is_match, "tested": true }));
+            if is_match {
+                matched.push(handle);
                 if !all_mode {
-                    break;
+                    // First-match mode: remaining cases are not tested.
+                    stopped = true;
                 }
             }
         }
 
-        if matched.is_empty() {
+        let used_default = matched.is_empty();
+        if used_default {
             let default_handle = config
                 .get("defaultHandle")
                 .or_else(|| config.get("default"))
@@ -96,7 +108,16 @@ impl NodeExecutor for SwitchExecutor {
             matched.push(default_handle.to_string());
         }
 
-        Ok(json!({ "matched": matched.clone(), "selectedHandles": matched }))
+        // Include the evaluated `value`, per-case results, and whether the default
+        // handle was used so the executions tab can show what was evaluated.
+        Ok(json!({
+            "value": value,
+            "mode": if all_mode { "all" } else { "first" },
+            "cases": evaluated,
+            "usedDefault": used_default,
+            "matched": matched.clone(),
+            "selectedHandles": matched,
+        }))
     }
 }
 

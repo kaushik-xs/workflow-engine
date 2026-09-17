@@ -319,80 +319,65 @@ pub async fn get_execution(
     Ok(row)
 }
 
+/// Push the shared `FROM` + optional tenant join + `WHERE` filters onto a query
+/// builder. Used by both `list_executions` and `count_executions` so the two
+/// always apply identical filtering.
+fn push_executions_filters<'a>(
+    qb: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
+    workflow_id: Option<Uuid>,
+    tenant: Option<&'a str>,
+    since: Option<DateTime<Utc>>,
+) {
+    qb.push(" FROM workflow_executions e");
+    // Tenant scoping is enforced by joining to the owning workflow row.
+    if let Some(t) = tenant {
+        qb.push(" INNER JOIN workflows w ON w.id = e.workflow_id AND w.tenant = ");
+        qb.push_bind(t);
+    }
+    qb.push(" WHERE TRUE");
+    if let Some(wid) = workflow_id {
+        qb.push(" AND e.workflow_id = ");
+        qb.push_bind(wid);
+    }
+    if let Some(s) = since {
+        qb.push(" AND e.started_at >= ");
+        qb.push_bind(s);
+    }
+}
+
+/// List executions, newest first, optionally filtered by workflow, tenant, and a
+/// lower bound on `started_at` (`since`). `limit`/`offset` drive pagination.
 pub async fn list_executions(
     pool: &sqlx::PgPool,
     workflow_id: Option<Uuid>,
     tenant: Option<&str>,
+    since: Option<DateTime<Utc>>,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<WorkflowExecution>, sqlx::Error> {
-    let rows = match (workflow_id, tenant) {
-        (Some(wid), Some(t)) => {
-            sqlx::query_as::<_, WorkflowExecution>(
-                r#"
-                SELECT e.id, e.workflow_id, e.workflow_version, e.status, e.context, e.started_at, e.finished_at
-                FROM workflow_executions e
-                INNER JOIN workflows w ON w.id = e.workflow_id AND w.tenant = $1
-                WHERE e.workflow_id = $2
-                ORDER BY e.started_at DESC
-                LIMIT $3 OFFSET $4
-                "#,
-            )
-            .bind(t)
-            .bind(wid)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?
-        }
-        (Some(wid), None) => {
-            sqlx::query_as::<_, WorkflowExecution>(
-                r#"
-                SELECT id, workflow_id, workflow_version, status, context, started_at, finished_at
-                FROM workflow_executions
-                WHERE workflow_id = $1
-                ORDER BY started_at DESC
-                LIMIT $2 OFFSET $3
-                "#,
-            )
-            .bind(wid)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?
-        }
-        (None, Some(t)) => {
-            sqlx::query_as::<_, WorkflowExecution>(
-                r#"
-                SELECT e.id, e.workflow_id, e.workflow_version, e.status, e.context, e.started_at, e.finished_at
-                FROM workflow_executions e
-                INNER JOIN workflows w ON w.id = e.workflow_id AND w.tenant = $1
-                ORDER BY e.started_at DESC
-                LIMIT $2 OFFSET $3
-                "#,
-            )
-            .bind(t)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?
-        }
-        (None, None) => {
-            sqlx::query_as::<_, WorkflowExecution>(
-                r#"
-                SELECT id, workflow_id, workflow_version, status, context, started_at, finished_at
-                FROM workflow_executions
-                ORDER BY started_at DESC
-                LIMIT $1 OFFSET $2
-                "#,
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?
-        }
-    };
-    Ok(rows)
+    let mut qb = sqlx::QueryBuilder::new(
+        "SELECT e.id, e.workflow_id, e.workflow_version, e.status, e.context, e.started_at, e.finished_at",
+    );
+    push_executions_filters(&mut qb, workflow_id, tenant, since);
+    qb.push(" ORDER BY e.started_at DESC LIMIT ");
+    qb.push_bind(limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(offset);
+    qb.build_query_as::<WorkflowExecution>().fetch_all(pool).await
+}
+
+/// Total number of executions matching the same filters as `list_executions`,
+/// ignoring `limit`/`offset`. Used to report the full count for pagination.
+pub async fn count_executions(
+    pool: &sqlx::PgPool,
+    workflow_id: Option<Uuid>,
+    tenant: Option<&str>,
+    since: Option<DateTime<Utc>>,
+) -> Result<i64, sqlx::Error> {
+    let mut qb = sqlx::QueryBuilder::new("SELECT COUNT(*)");
+    push_executions_filters(&mut qb, workflow_id, tenant, since);
+    let (count,): (i64,) = qb.build_query_as().fetch_one(pool).await?;
+    Ok(count)
 }
 
 pub async fn insert_step(

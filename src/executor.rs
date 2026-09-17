@@ -263,6 +263,24 @@ async fn run_single_node(
     }
 }
 
+/// Record a node id as skipped in `context.skipped` (deduplicated). Skipped nodes
+/// produce no `nodes.<id>` output, so this list is how the executions view learns
+/// which nodes were bypassed by a conditional branch (vs. never reached).
+fn mark_skipped(context: &mut Value, node_id: &str) {
+    if !context.is_object() {
+        *context = Value::Object(serde_json::Map::new());
+    }
+    let obj = context.as_object_mut().unwrap();
+    let arr = obj
+        .entry("skipped")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(list) = arr.as_array_mut() {
+        if !list.iter().any(|v| v.as_str() == Some(node_id)) {
+            list.push(Value::String(node_id.to_string()));
+        }
+    }
+}
+
 /// Merge a set of variables into the context's `local` scope, creating it if absent.
 fn merge_into_local(context: &mut Value, vars: &serde_json::Map<String, Value>) {
     if !context.is_object() {
@@ -349,6 +367,7 @@ pub async fn run_workflow(
             storage::insert_step(pool, execution_id, &node_id, "skipped", None, None)
                 .await
                 .map_err(|e| e.to_string())?;
+            mark_skipped(&mut context, &node_id);
             continue;
         }
 
@@ -526,6 +545,7 @@ pub async fn run_next_step(
         storage::insert_step(pool, execution_id, &candidate, "skipped", None, None)
             .await
             .map_err(|e| e.to_string())?;
+        mark_skipped(&mut context, &candidate);
         resolved.insert(candidate);
     };
 

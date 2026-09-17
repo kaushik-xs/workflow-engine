@@ -20,29 +20,36 @@ use serde_json::{json, Value};
 
 pub struct IfExecutor;
 
-/// Resolve the boolean outcome from an already-interpolated `config`/`input`.
+/// Resolve the boolean outcome from an already-interpolated `config`/`input`,
+/// together with a JSON description of exactly what was evaluated so the
+/// execution trace can show the operands, not just the result.
 ///
 /// Precedence: a structured `condition` object with an `operator`, then a top-level
 /// `operator`, then the plain truthiness of `condition`.
-fn evaluate(config: &Value, input: &Value) -> Result<bool, String> {
+fn evaluate(config: &Value, input: &Value) -> Result<(bool, Value), String> {
     let condition = config.get("condition").or_else(|| input.get("condition"));
 
     if let Some(cond) = condition {
         if let Some(op) = cond.get("operator").and_then(Value::as_str) {
             let left = cond.get("left").cloned().unwrap_or(Value::Null);
             let right = cond.get("right").cloned().unwrap_or(Value::Null);
-            return condition::compare(&left, op, &right);
+            let result = condition::compare(&left, op, &right)?;
+            return Ok((result, json!({ "left": left, "operator": op, "right": right })));
         }
     }
 
     if let Some(op) = config.get("operator").and_then(Value::as_str) {
         let left = config.get("left").cloned().unwrap_or(Value::Null);
         let right = config.get("right").cloned().unwrap_or(Value::Null);
-        return condition::compare(&left, op, &right);
+        let result = condition::compare(&left, op, &right)?;
+        return Ok((result, json!({ "left": left, "operator": op, "right": right })));
     }
 
     match condition {
-        Some(v) => Ok(condition::truthy(v)),
+        Some(v) => Ok((
+            condition::truthy(v),
+            json!({ "value": v, "operator": "truthy" }),
+        )),
         None => Err(
             "If: provide a `condition` (value or { left, operator, right }) or top-level `operator`"
                 .to_string(),
@@ -59,7 +66,7 @@ impl NodeExecutor for IfExecutor {
         input: Value,
         config: Value,
     ) -> Result<Value, String> {
-        let result = evaluate(&config, &input)?;
+        let (result, condition) = evaluate(&config, &input)?;
         let true_handle = config
             .get("trueHandle")
             .and_then(Value::as_str)
@@ -69,7 +76,13 @@ impl NodeExecutor for IfExecutor {
             .and_then(Value::as_str)
             .unwrap_or("false");
         let handle = if result { true_handle } else { false_handle };
-        Ok(json!({ "result": result, "selectedHandles": [handle] }))
+        // `condition` records the operands/operator that produced `result`, so the
+        // executions tab can show what was evaluated, not just the outcome.
+        Ok(json!({
+            "result": result,
+            "condition": condition,
+            "selectedHandles": [handle],
+        }))
     }
 }
 
