@@ -88,6 +88,16 @@ struct ExecutionListResponse {
     offset: i64,
 }
 
+/// Just the webhook trigger input (body + headers) of the latest execution — the
+/// only data the "Execute workflow" dialog needs to pre-fill a re-run.
+#[derive(Serialize)]
+struct LatestInputResponse {
+    execution_id: Option<Uuid>,
+    started_at: Option<String>,
+    body: Option<serde_json::Value>,
+    headers: Option<serde_json::Value>,
+}
+
 #[derive(Serialize)]
 struct StepItem {
     node_id: String,
@@ -142,6 +152,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .route("/globals", get(list_globals).put(set_global))
         .route("/globals/:key", get(get_global).put(set_global_by_key).delete(delete_global))
         .route("/executions", get(list_executions))
+        .route("/executions/latest-input", get(latest_execution_input))
         .route("/executions/:id", get(get_execution))
         .route("/executions/:id/step", post(run_next_step_handler))
         .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)))
@@ -611,6 +622,36 @@ async fn list_executions(
         total,
         limit,
         offset,
+    }))
+}
+
+/// Return only the webhook trigger input (body + headers) of the most recent
+/// execution for a workflow. Lets the Execute dialog pre-fill a re-run without
+/// pulling every node's output in the full execution context.
+async fn latest_execution_input(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<ExecutionsQuery>,
+) -> Result<Json<LatestInputResponse>, AppError> {
+    let tenant_header = tenant_from_headers(&headers);
+    let tenant = tenant_header.as_deref();
+    let rows = storage::list_executions(&state.pool, query.workflow_id, tenant, None, 1, 0)
+        .await
+        .map_err(AppError::from)?;
+    let Some(exec) = rows.into_iter().next() else {
+        return Ok(Json(LatestInputResponse {
+            execution_id: None,
+            started_at: None,
+            body: None,
+            headers: None,
+        }));
+    };
+    let webhook = exec.context.get("Webhook");
+    Ok(Json(LatestInputResponse {
+        execution_id: Some(exec.id),
+        started_at: Some(exec.started_at.to_rfc3339()),
+        body: webhook.and_then(|w| w.get("body")).cloned(),
+        headers: webhook.and_then(|w| w.get("headers")).cloned(),
     }))
 }
 
