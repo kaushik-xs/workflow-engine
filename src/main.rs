@@ -8,6 +8,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
+use tracing::Instrument;
 use uuid::Uuid;
 use workflow_engine::error::AppError;
 use workflow_engine::executor;
@@ -106,11 +107,9 @@ fn parse_version(v: Option<&serde_json::Value>) -> Option<i32> {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "workflow_engine=info,tower_http=info".into()),
-        )
-        .init();
+    // JSON logs by default; every line carries `trace_id` from the execution span.
+    // Set LOG_FORMAT=text (or pretty) for human-readable local logs.
+    workflow_engine::logging::init("workflow_engine=info,tower_http=info");
 
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/workflow_engine".into());
@@ -400,6 +399,14 @@ async fn trigger_webhook(
         }));
     }
 
+    // Continue the caller's trace (from the incoming `traceparent`), or start a root.
+    let trace_id = workflow_engine::trace::resolve_trace_id(&headers);
+    let span = tracing::info_span!(
+        "execution",
+        trace_id = %trace_id,
+        execution_id = %exec.id,
+        workflow_id = %workflow.id,
+    );
     let result = executor::run_workflow(
         &state.pool,
         state.node_registry.clone(),
@@ -407,7 +414,9 @@ async fn trigger_webhook(
         exec.id,
         &workflow.definition,
         initial_context,
+        Some(trace_id.clone()),
     )
+    .instrument(span)
     .await;
 
     let (status, error) = match &result {
@@ -638,6 +647,8 @@ async fn run_next_step_handler(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
 
+    let trace_id = workflow_engine::trace::resolve_trace_id(&headers);
+    let span = tracing::info_span!("execution", trace_id = %trace_id, execution_id = %id);
     let _ = executor::run_next_step(
         &state.pool,
         state.node_registry.clone(),
@@ -645,7 +656,9 @@ async fn run_next_step_handler(
         exec.workflow_id,
         &workflow.definition,
         exec.context,
+        Some(trace_id.clone()),
     )
+    .instrument(span)
     .await;
 
     let exec = storage::get_execution(&state.pool, id)

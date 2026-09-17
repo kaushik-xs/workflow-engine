@@ -14,6 +14,10 @@ pub struct ExecutionContext {
     pub workflow_id: Uuid,
     pub execution_id: Uuid,
     pub tenant: Option<String>,
+    /// W3C trace id (32 hex) for this execution. Outbound nodes forward it as a
+    /// `traceparent` header so downstream services join the same trace. `None`
+    /// when no trace is in scope.
+    pub trace_id: Option<String>,
 }
 
 impl ExecutionContext {
@@ -23,6 +27,7 @@ impl ExecutionContext {
             workflow_id,
             execution_id,
             tenant: None,
+            trace_id: None,
         }
     }
 
@@ -160,12 +165,14 @@ async fn run_single_node(
     context: Value,
     last_output: Value,
     node: &NodeSpec,
+    trace_id: Option<&str>,
 ) -> Result<(Value, Value), String> {
     let executor = node_registry
         .get(&node.node_type)
         .ok_or_else(|| format!("unknown node type: {}", node.node_type))?;
 
     let mut exec_ctx = ExecutionContext::new(workflow_id, execution_id, context);
+    exec_ctx.trace_id = trace_id.map(str::to_string);
     exec_ctx.set_current(last_output);
 
     let mut input = node.input.clone();
@@ -301,6 +308,7 @@ pub async fn run_workflow(
     execution_id: Uuid,
     definition: &Value,
     initial_context: Value,
+    trace_id: Option<String>,
 ) -> Result<Value, String> {
     let (node_specs, edge_specs) = definition::parse_workflow(definition)?;
     let order = topological_order(&node_specs, &edge_specs);
@@ -357,6 +365,7 @@ pub async fn run_workflow(
             context,
             last_output,
             node,
+            trace_id.as_deref(),
         )
         .await?;
         context = new_ctx;
@@ -450,6 +459,7 @@ pub async fn run_next_step(
     workflow_id: Uuid,
     definition: &Value,
     mut context: Value,
+    trace_id: Option<String>,
 ) -> Result<RunNextStepResult, String> {
     let (node_specs, edge_specs) = definition::parse_workflow(definition)?;
     let order = topological_order(&node_specs, &edge_specs);
@@ -550,6 +560,7 @@ pub async fn run_next_step(
         context,
         last_output,
         node,
+        trace_id.as_deref(),
     )
     .await?;
 

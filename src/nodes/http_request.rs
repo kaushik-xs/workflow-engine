@@ -102,6 +102,20 @@ impl NodeExecutor for HttpRequestExecutor {
                 }
             }
         }
+        // Continue this execution's trace on the outbound call, unless the workflow
+        // author set a traceparent header explicitly (fresh span-id per hop).
+        if let Some(tid) = ctx.trace_id.as_deref().filter(|s| !s.is_empty()) {
+            let user_set = headers
+                .as_object()
+                .map(|m| m.keys().any(|k| k.eq_ignore_ascii_case(crate::trace::TRACEPARENT_HEADER)))
+                .unwrap_or(false);
+            if !user_set {
+                req = req.header(
+                    crate::trace::TRACEPARENT_HEADER,
+                    crate::trace::format_traceparent(tid),
+                );
+            }
+        }
 
         let resp = req.send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();

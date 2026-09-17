@@ -112,6 +112,13 @@ impl NodeExecutor for ServiceCallExecutor {
             }
         }
 
+        // Continue this execution's trace on the outbound call (fresh span-id per hop).
+        let traceparent = ctx
+            .trace_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(crate::trace::format_traceparent);
+
         let apply_headers_and_body =
             |req: reqwest::RequestBuilder, config: &Value, input: &Value| {
                 let body = config
@@ -142,6 +149,15 @@ impl NodeExecutor for ServiceCallExecutor {
                 for (k, v) in &headers {
                     if let Some(s) = v.as_str() {
                         req = req.header(k.as_str(), s);
+                    }
+                }
+                // Add traceparent unless the workflow author set one explicitly.
+                if let Some(ref tp) = traceparent {
+                    let user_set = headers
+                        .keys()
+                        .any(|k| k.eq_ignore_ascii_case(crate::trace::TRACEPARENT_HEADER));
+                    if !user_set {
+                        req = req.header(crate::trace::TRACEPARENT_HEADER, tp);
                     }
                 }
                 req

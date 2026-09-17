@@ -197,6 +197,8 @@ impl NodeExecutor for WorkflowCallExecutor {
             sub_exec.id,
             &workflow.definition,
             initial_context,
+            // Sub-workflow runs in-process under the same trace as its parent.
+            ctx.trace_id.clone(),
         )
         .await?;
 
