@@ -50,6 +50,36 @@ fn runtime() -> &'static Runtime {
             )),
         );
 
+        // zip(array, array, ...) -> array of tuples, truncated to the shortest input (like Python zip).
+        // Standard JMESPath cannot correlate two parallel arrays by index (`[*]` exposes only the
+        // current element, never its position), so this closes that gap. Given two parallel arrays
+        // `zip([a, b], [1, 2])` yields `[[a, 1], [b, 2]]`; callers then shape each pair via a
+        // multiselect hash `[*].{step: [0], ticketId: [1]}` or `[*].merge([0], {ticketId: [1]})`.
+        rt.register_function(
+            "zip",
+            Box::new(CustomFunction::new(
+                // At least two arrays; the variadic slot allows three or more.
+                Signature::new(
+                    vec![ArgumentType::Array, ArgumentType::Array],
+                    Some(ArgumentType::Array),
+                ),
+                Box::new(|args: &[Rcvar], _ctx| {
+                    // Signature validation guarantees every argument is an array.
+                    let arrays: Vec<&Vec<Rcvar>> = args
+                        .iter()
+                        .map(|a| a.as_array().expect("validated as array"))
+                        .collect();
+                    let len = arrays.iter().map(|a| a.len()).min().unwrap_or(0);
+                    let mut out: Vec<Rcvar> = Vec::with_capacity(len);
+                    for i in 0..len {
+                        let tuple: Vec<Rcvar> = arrays.iter().map(|a| a[i].clone()).collect();
+                        out.push(Rcvar::new(jmespath::Variable::Array(tuple)));
+                    }
+                    Ok(Rcvar::new(jmespath::Variable::Array(out)))
+                }),
+            )),
+        );
+
         rt
     })
 }
@@ -318,6 +348,69 @@ mod tests {
     fn parse_json_errors_on_malformed_input() {
         let ctx = serde_json::json!({ "Webhook": { "body": { "assignees": "not json" } } });
         assert!(evaluate("parse_json(Webhook.body.assignees)", &ctx).is_err());
+    }
+
+    #[test]
+    fn zip_correlates_parallel_arrays_by_index() {
+        let ctx = serde_json::json!({
+            "current": {
+                "nmSteps": [{ "name": "s0" }, { "name": "s1" }, { "name": "s2" }],
+                "nmTicketIds": ["id0", "id1", "id2"]
+            }
+        });
+
+        // Raw pairing: [[step, id], ...].
+        assert_eq!(
+            evaluate("zip(current.nmSteps, current.nmTicketIds)", &ctx).unwrap(),
+            serde_json::json!([
+                [{ "name": "s0" }, "id0"],
+                [{ "name": "s1" }, "id1"],
+                [{ "name": "s2" }, "id2"]
+            ])
+        );
+
+        // Shape each pair into an object via multiselect hash.
+        assert_eq!(
+            evaluate(
+                "zip(current.nmSteps, current.nmTicketIds)[*].{step: [0], ticketId: [1]}",
+                &ctx
+            )
+            .unwrap(),
+            serde_json::json!([
+                { "step": { "name": "s0" }, "ticketId": "id0" },
+                { "step": { "name": "s1" }, "ticketId": "id1" },
+                { "step": { "name": "s2" }, "ticketId": "id2" }
+            ])
+        );
+
+        // Merge ticketId into each step object: [{...step, ticketId}, ...].
+        assert_eq!(
+            evaluate(
+                "zip(current.nmSteps, current.nmTicketIds)[*].merge([0], {ticketId: [1]})",
+                &ctx
+            )
+            .unwrap(),
+            serde_json::json!([
+                { "name": "s0", "ticketId": "id0" },
+                { "name": "s1", "ticketId": "id1" },
+                { "name": "s2", "ticketId": "id2" }
+            ])
+        );
+    }
+
+    #[test]
+    fn zip_truncates_to_shortest_and_accepts_three_arrays() {
+        let ctx = serde_json::json!({
+            "a": [1, 2, 3],
+            "b": ["x", "y"],
+            "c": [true, false, true, false]
+        });
+
+        // Truncates to the shortest input (length 2).
+        assert_eq!(
+            evaluate("zip(a, b, c)", &ctx).unwrap(),
+            serde_json::json!([[1, "x", true], [2, "y", false]])
+        );
     }
 
     #[test]
