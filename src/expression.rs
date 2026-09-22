@@ -523,6 +523,28 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_explodes_child_array_nested_under_key() {
+        // Explode an array child into one row per item, keeping the item nested under its
+        // original key, with the parent id attached. Wrap each item as `{key: @}` at parent
+        // scope, then broadcast the parent id in; the trailing `[]` flattens across parents.
+        let ctx = serde_json::json!({
+            "items": [
+                { "id": "p1", "deps": [ { "d": "a" }, { "d": "b" } ] },
+                { "id": "p2", "deps": [ { "d": "c" } ] }
+            ]
+        });
+
+        assert_eq!(
+            evaluate("items[*].broadcast(deps[*].{deps: @}, {id: id})[]", &ctx).unwrap(),
+            serde_json::json!([
+                { "id": "p1", "deps": { "d": "a" } },
+                { "id": "p1", "deps": { "d": "b" } },
+                { "id": "p2", "deps": { "d": "c" } }
+            ])
+        );
+    }
+
+    #[test]
     fn broadcast_flattens_children_across_parents() {
         // The real use case: one combined flat array, each row carrying its parent id.
         let ctx = serde_json::json!({
