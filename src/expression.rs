@@ -7,7 +7,7 @@
 use jmespath::functions::{ArgumentType, CustomFunction, Signature};
 use jmespath::{ErrorReason, Rcvar, Runtime};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use tracing;
 
@@ -74,6 +74,67 @@ fn runtime() -> &'static Runtime {
                     for i in 0..len {
                         let tuple: Vec<Rcvar> = arrays.iter().map(|a| a[i].clone()).collect();
                         out.push(Rcvar::new(jmespath::Variable::Array(tuple)));
+                    }
+                    Ok(Rcvar::new(jmespath::Variable::Array(out)))
+                }),
+            )),
+        );
+
+        // broadcast(array_or_object_or_null, object) -> array
+        // Merge a fixed set of fields into EVERY element of an array. Closes the gap that
+        // JMESPath projections drop the outer scope: inside `parent[*]` you can read the
+        // parent's `id`, but `parent[*].children[*]` can no longer see it. `broadcast` lets
+        // you stamp parent-level fields onto each child row while still at parent scope, e.g.
+        //   items[*].broadcast(notifyWorkflowSteps, {id: id})[]
+        // yields one flat array of child rows, each carrying its parent's id.
+        //
+        // First arg is tolerant of shape: an array is used as-is; a single object is treated
+        // as a one-element array; null/absent yields `[]`. The fields object (second arg) is
+        // merged over each element, so its keys win on collision (same order as built-in `merge`).
+        // Elements must be objects; a non-object element is an error.
+        rt.register_function(
+            "broadcast",
+            Box::new(CustomFunction::new(
+                Signature::new(vec![ArgumentType::Any, ArgumentType::Object], None),
+                Box::new(|args: &[Rcvar], _ctx| {
+                    // Normalize arg0 to a list of elements: array as-is, object -> [object],
+                    // null -> []. Any other scalar type cannot be broadcast into.
+                    let elements: Vec<Rcvar> = if let Some(arr) = args[0].as_array() {
+                        arr.clone()
+                    } else if args[0].as_object().is_some() {
+                        vec![args[0].clone()]
+                    } else if args[0].is_null() {
+                        Vec::new()
+                    } else {
+                        return Err(jmespath::JmespathError::new(
+                            "",
+                            0,
+                            ErrorReason::Parse(
+                                "broadcast: first argument must be an array, object, or null"
+                                    .to_string(),
+                            ),
+                        ));
+                    };
+                    // Signature validation guarantees arg1 is an object.
+                    let fields = args[1].as_object().expect("validated as object");
+
+                    let mut out: Vec<Rcvar> = Vec::with_capacity(elements.len());
+                    for el in elements {
+                        let base = el.as_object().ok_or_else(|| {
+                            jmespath::JmespathError::new(
+                                "",
+                                0,
+                                ErrorReason::Parse(
+                                    "broadcast: every element must be an object".to_string(),
+                                ),
+                            )
+                        })?;
+                        // Element fields first, then the broadcast fields override on collision.
+                        let mut merged: BTreeMap<String, Rcvar> = base.clone();
+                        for (k, v) in fields.iter() {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        out.push(Rcvar::new(jmespath::Variable::Object(merged)));
                     }
                     Ok(Rcvar::new(jmespath::Variable::Array(out)))
                 }),
@@ -410,6 +471,74 @@ mod tests {
         assert_eq!(
             evaluate("zip(a, b, c)", &ctx).unwrap(),
             serde_json::json!([[1, "x", true], [2, "y", false]])
+        );
+    }
+
+    #[test]
+    fn broadcast_stamps_fields_onto_each_element() {
+        let ctx = serde_json::json!({
+            "id": "parent-1",
+            "rows": [{ "step": "a" }, { "step": "b" }]
+        });
+
+        // Parent id is broadcast into every row.
+        assert_eq!(
+            evaluate("broadcast(rows, {id: id})", &ctx).unwrap(),
+            serde_json::json!([
+                { "step": "a", "id": "parent-1" },
+                { "step": "b", "id": "parent-1" }
+            ])
+        );
+    }
+
+    #[test]
+    fn broadcast_fields_win_on_collision() {
+        let ctx = serde_json::json!({
+            "id": "parent-1",
+            "rows": [{ "id": "child-own" }]
+        });
+
+        // The broadcast object overrides an element's existing key (merge order).
+        assert_eq!(
+            evaluate("broadcast(rows, {id: id})", &ctx).unwrap(),
+            serde_json::json!([{ "id": "parent-1" }])
+        );
+    }
+
+    #[test]
+    fn broadcast_tolerates_object_and_null_first_arg() {
+        // A single object is treated as a one-element array.
+        let obj_ctx = serde_json::json!({ "id": "p", "one": { "k": 1 } });
+        assert_eq!(
+            evaluate("broadcast(one, {id: id})", &obj_ctx).unwrap(),
+            serde_json::json!([{ "k": 1, "id": "p" }])
+        );
+
+        // A null / absent field yields an empty array (not an error).
+        let null_ctx = serde_json::json!({ "id": "p" });
+        assert_eq!(
+            evaluate("broadcast(missing, {id: id})", &null_ctx).unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn broadcast_flattens_children_across_parents() {
+        // The real use case: one combined flat array, each row carrying its parent id.
+        let ctx = serde_json::json!({
+            "items": [
+                { "id": "p1", "notify": [{ "n": 1 }, { "n": 2 }] },
+                { "id": "p2", "notify": [{ "n": 3 }] }
+            ]
+        });
+
+        assert_eq!(
+            evaluate("items[*].broadcast(notify, {id: id})[]", &ctx).unwrap(),
+            serde_json::json!([
+                { "n": 1, "id": "p1" },
+                { "n": 2, "id": "p1" },
+                { "n": 3, "id": "p2" }
+            ])
         );
     }
 
