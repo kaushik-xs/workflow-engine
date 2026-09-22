@@ -141,6 +141,172 @@ fn runtime() -> &'static Runtime {
             )),
         );
 
+        // lookup_map(keys, table, match_field, return_spec) -> array (aligned to keys)
+        // A value-join JMESPath cannot express on its own: inside a projection the current
+        // element is the only scope, so `steps[*]` can never reach back to a separate `tickets`
+        // array to correlate by value. Passing every array as an explicit argument closes that
+        // gap. For each key, the first `table` row whose `match_field` EQUALS that key supplies
+        // the result; a miss yields `null` (one uniform sentinel), keeping the output aligned so
+        // it can feed `zip`/`to_object`.
+        //
+        // `return_spec` picks what a matched row contributes:
+        //   - a string field name   -> that field's value (a scalar), or null if absent
+        //   - an array of names      -> an object with just those fields (absent field -> null)
+        // Chain two calls for a two-hop join (steps->tickets->milestones), then build the dict:
+        //   to_object(zip(steps[*].id,
+        //     lookup_map(lookup_map(steps[*].name, tickets, 'title', 'id'),
+        //                milestones, 'ticketId', 'id')))
+        rt.register_function(
+            "lookup_map",
+            Box::new(CustomFunction::new(
+                Signature::new(
+                    vec![
+                        ArgumentType::Array,
+                        ArgumentType::Array,
+                        ArgumentType::String,
+                        ArgumentType::Any,
+                    ],
+                    None,
+                ),
+                Box::new(|args: &[Rcvar], _ctx| {
+                    // Signature validation guarantees the first three argument types.
+                    let keys = args[0].as_array().expect("validated as array");
+                    let table = args[1].as_array().expect("validated as array");
+                    let match_field = args[2].as_string().expect("validated as string");
+
+                    // Resolve return_spec into a list of field names once, up front. A bare string
+                    // marks scalar mode (single field); an array marks object mode (field subset).
+                    let (scalar_field, object_fields): (Option<&String>, Option<Vec<String>>) =
+                        if let Some(name) = args[3].as_string() {
+                            (Some(name), None)
+                        } else if let Some(names) = args[3].as_array() {
+                            let mut fields = Vec::with_capacity(names.len());
+                            for n in names {
+                                let name = n.as_string().ok_or_else(|| {
+                                    jmespath::JmespathError::new(
+                                        "",
+                                        0,
+                                        ErrorReason::Parse(
+                                            "lookup_map: every return field name must be a string"
+                                                .to_string(),
+                                        ),
+                                    )
+                                })?;
+                                fields.push(name.clone());
+                            }
+                            (None, Some(fields))
+                        } else {
+                            return Err(jmespath::JmespathError::new(
+                                "",
+                                0,
+                                ErrorReason::Parse(
+                                    "lookup_map: return spec must be a field name or an array of field names"
+                                        .to_string(),
+                                ),
+                            ));
+                        };
+
+                    let null = || Rcvar::new(jmespath::Variable::Null);
+                    let mut out: Vec<Rcvar> = Vec::with_capacity(keys.len());
+                    for key in keys {
+                        // First row whose match_field equals this key. Non-object rows and rows
+                        // missing the field simply cannot match, so they are skipped.
+                        let matched = table.iter().find_map(|row| {
+                            let obj = row.as_object()?;
+                            match obj.get(match_field.as_str()) {
+                                Some(v) if v == key => Some(obj),
+                                _ => None,
+                            }
+                        });
+
+                        let value = match matched {
+                            // Miss -> single null sentinel, regardless of return spec.
+                            None => null(),
+                            Some(obj) => {
+                                if let Some(field) = scalar_field {
+                                    obj.get(field.as_str()).cloned().unwrap_or_else(null)
+                                } else {
+                                    // Object mode: a matched row with an absent field carries null.
+                                    let fields = object_fields.as_ref().expect("object mode");
+                                    let mut picked: BTreeMap<String, Rcvar> = BTreeMap::new();
+                                    for name in fields {
+                                        let v = obj.get(name.as_str()).cloned().unwrap_or_else(null);
+                                        picked.insert(name.clone(), v);
+                                    }
+                                    Rcvar::new(jmespath::Variable::Object(picked))
+                                }
+                            }
+                        };
+                        out.push(value);
+                    }
+                    Ok(Rcvar::new(jmespath::Variable::Array(out)))
+                }),
+            )),
+        );
+
+        // to_object(pairs[, 'keep_nulls']) -> object
+        // The dynamic-key builder JMESPath lacks: a multiselect hash `{k: v}` only accepts LITERAL
+        // keys, so an object whose keys come from data cannot be built in-expression. `to_object`
+        // folds an array of `[key, value]` pairs (naturally produced by `zip`) into one object.
+        // Keys must be strings; on a duplicate key the last pair wins.
+        //
+        // A `null` value marks a `lookup_map` miss. By default such pairs are DROPPED, so a miss
+        // means the key is simply absent from the dict. Pass the flag `'keep_nulls'` to keep them
+        // as explicit null values instead.
+        rt.register_function(
+            "to_object",
+            Box::new(CustomFunction::new(
+                // One array of pairs, plus an optional trailing flag string.
+                Signature::new(vec![ArgumentType::Array], Some(ArgumentType::String)),
+                Box::new(|args: &[Rcvar], _ctx| {
+                    // Signature validation guarantees arg0 is an array.
+                    let pairs = args[0].as_array().expect("validated as array");
+                    let keep_nulls = args
+                        .get(1)
+                        .and_then(|a| a.as_string())
+                        .map(|s| s == "keep_nulls")
+                        .unwrap_or(false);
+
+                    let mut out: BTreeMap<String, Rcvar> = BTreeMap::new();
+                    for pair in pairs {
+                        let tuple = pair.as_array().ok_or_else(|| {
+                            jmespath::JmespathError::new(
+                                "",
+                                0,
+                                ErrorReason::Parse(
+                                    "to_object: each entry must be a [key, value] pair".to_string(),
+                                ),
+                            )
+                        })?;
+                        if tuple.len() != 2 {
+                            return Err(jmespath::JmespathError::new(
+                                "",
+                                0,
+                                ErrorReason::Parse(
+                                    "to_object: each entry must have exactly two elements"
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                        let key = tuple[0].as_string().ok_or_else(|| {
+                            jmespath::JmespathError::new(
+                                "",
+                                0,
+                                ErrorReason::Parse("to_object: keys must be strings".to_string()),
+                            )
+                        })?;
+                        let value = &tuple[1];
+                        // Drop misses unless the caller opted to keep them.
+                        if value.is_null() && !keep_nulls {
+                            continue;
+                        }
+                        out.insert(key.clone(), value.clone());
+                    }
+                    Ok(Rcvar::new(jmespath::Variable::Object(out)))
+                }),
+            )),
+        );
+
         rt
     })
 }
@@ -561,6 +727,99 @@ mod tests {
                 { "n": 2, "id": "p1" },
                 { "n": 3, "id": "p2" }
             ])
+        );
+    }
+
+    #[test]
+    fn lookup_map_joins_by_value_regardless_of_order() {
+        // Milestones are deliberately in a different order than the steps: the join must be by
+        // value (ticketId), not by position.
+        let ctx = serde_json::json!({
+            "steps": [
+                { "id": "step-A", "name": "Fix login bug" },
+                { "id": "step-B", "name": "Add logout" }
+            ],
+            "tickets": [
+                { "id": "tik-1", "title": "Fix login bug" },
+                { "id": "tik-2", "title": "Add logout" }
+            ],
+            "milestones": [
+                { "id": "ms-2", "ticketId": "tik-2" },
+                { "id": "ms-1", "ticketId": "tik-1" }
+            ]
+        });
+
+        // The full two-hop build: step.id -> milestone.id.
+        assert_eq!(
+            evaluate(
+                "to_object(zip(steps[*].id, lookup_map(lookup_map(steps[*].name, tickets, 'title', 'id'), milestones, 'ticketId', 'id')))",
+                &ctx
+            )
+            .unwrap(),
+            serde_json::json!({ "step-A": "ms-1", "step-B": "ms-2" })
+        );
+    }
+
+    #[test]
+    fn lookup_map_returns_multiple_fields_as_object() {
+        let ctx = serde_json::json!({
+            "keys": ["tik-1"],
+            "milestones": [{ "id": "ms-1", "ticketId": "tik-1", "extra": "x" }]
+        });
+
+        // An array return spec yields an object with just those fields.
+        assert_eq!(
+            evaluate("lookup_map(keys, milestones, 'ticketId', ['id', 'ticketId'])", &ctx).unwrap(),
+            serde_json::json!([{ "id": "ms-1", "ticketId": "tik-1" }])
+        );
+    }
+
+    #[test]
+    fn lookup_map_miss_yields_null_for_both_return_shapes() {
+        let ctx = serde_json::json!({
+            "keys": ["absent"],
+            "table": [{ "k": "present", "v": 1 }]
+        });
+
+        // Scalar mode miss -> null.
+        assert_eq!(
+            evaluate("lookup_map(keys, table, 'k', 'v')", &ctx).unwrap(),
+            serde_json::json!([null])
+        );
+        // Object mode miss -> a single null sentinel, not an object of nulls.
+        assert_eq!(
+            evaluate("lookup_map(keys, table, 'k', ['v'])", &ctx).unwrap(),
+            serde_json::json!([null])
+        );
+    }
+
+    #[test]
+    fn to_object_folds_pairs_and_last_key_wins() {
+        let ctx = serde_json::json!({
+            "pairs": [["a", 1], ["b", 2], ["a", 3]]
+        });
+
+        assert_eq!(
+            evaluate("to_object(pairs)", &ctx).unwrap(),
+            serde_json::json!({ "a": 3, "b": 2 })
+        );
+    }
+
+    #[test]
+    fn to_object_drops_null_values_unless_keep_nulls() {
+        let ctx = serde_json::json!({
+            "pairs": [["a", 1], ["b", null]]
+        });
+
+        // Default: the null-valued pair (a lookup miss) is omitted.
+        assert_eq!(
+            evaluate("to_object(pairs)", &ctx).unwrap(),
+            serde_json::json!({ "a": 1 })
+        );
+        // Opt in to keep it as an explicit null.
+        assert_eq!(
+            evaluate("to_object(pairs, 'keep_nulls')", &ctx).unwrap(),
+            serde_json::json!({ "a": 1, "b": null })
         );
     }
 
