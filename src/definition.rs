@@ -7,6 +7,8 @@ pub struct NodeSpec {
     pub node_type: String,
     pub config: Value,
     pub input: Value,
+    /// Enclosing Loop node id (React Flow `parentId`), `None` for top-level nodes.
+    pub parent: Option<String>,
 }
 
 /// Edge for execution order.
@@ -101,11 +103,19 @@ fn node_to_spec(node: &Value) -> Result<NodeSpec, String> {
     let data = node.get("data").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
     let config = data.clone();
     let input = data.get("input").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+    // React Flow v12 names the enclosing group `parentId` (v11: `parentNode`).
+    let parent = node
+        .get("parentId")
+        .or_else(|| node.get("parentNode"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     Ok(NodeSpec {
         id,
         node_type,
         config,
         input,
+        parent,
     })
 }
 

@@ -1,5 +1,6 @@
-use crate::definition::{self, NodeSpec};
+use crate::definition::{self, EdgeSpec, NodeSpec};
 use crate::expression;
+use crate::nodes::NodeExecutor;
 use crate::registry::NodeRegistry;
 use crate::storage;
 use serde_json::Value;
@@ -54,7 +55,7 @@ impl ExecutionContext {
 }
 
 /// Topological sort of node ids: nodes that have no incoming edges (or only from self) come first.
-fn topological_order(node_specs: &[NodeSpec], edges: &[crate::definition::EdgeSpec]) -> Vec<String> {
+fn topological_order(node_specs: &[&NodeSpec], edges: &[EdgeSpec]) -> Vec<String> {
     let node_ids: HashSet<String> = node_specs.iter().map(|n| n.id.clone()).collect();
     let mut in_degree: HashMap<String, usize> = node_ids.iter().cloned().map(|id| (id, 0)).collect();
     let mut out_edges: HashMap<String, Vec<String>> =
@@ -156,60 +157,128 @@ pub struct RunNextStepResult {
     pub context: Value,
 }
 
-/// Run a single node and persist execution + step. Returns updated (context, last_output) or Err on failure.
-async fn run_single_node(
-    pool: &sqlx::PgPool,
-    node_registry: &dyn NodeRegistry,
+/// Node type of the loop container. Nodes whose `parent` is a Loop form its body.
+const LOOP_NODE_TYPE: &str = "Loop";
+
+/// What every node run needs besides the evolving context.
+struct RunEnv<'a> {
+    pool: &'a sqlx::PgPool,
+    registry: &'a dyn NodeRegistry,
     workflow_id: Uuid,
     execution_id: Uuid,
+    trace_id: Option<&'a str>,
+    nodes: &'a [NodeSpec],
+    edges: &'a [EdgeSpec],
+}
+
+/// Step tag for a run inside loops: the loop indices from the outermost loop inwards,
+/// dot-joined ("0", "2.1"). Empty at the top level.
+fn iteration_tag(path: &[usize]) -> String {
+    path.iter().map(usize::to_string).collect::<Vec<_>>().join(".")
+}
+
+/// The nodes directly inside one scope (the top level, or one Loop's body) and their wiring.
+struct ScopeGraph<'a> {
+    order: Vec<String>,
+    nodes_by_id: HashMap<String, &'a NodeSpec>,
+    pred: HashMap<String, Vec<String>>,
+    incoming: HashMap<String, Vec<EdgeSpec>>,
+}
+
+impl<'a> ScopeGraph<'a> {
+    fn new(nodes: &'a [NodeSpec], edges: &[EdgeSpec], parent: Option<&str>) -> Self {
+        let scoped: Vec<&NodeSpec> = nodes.iter().filter(|n| n.parent.as_deref() == parent).collect();
+        let node_ids: HashSet<String> = scoped.iter().map(|n| n.id.clone()).collect();
+        Self {
+            order: topological_order(&scoped, edges),
+            nodes_by_id: scoped.iter().map(|n| (n.id.clone(), *n)).collect(),
+            pred: predecessors_by_node(edges, &node_ids),
+            incoming: incoming_edges_by_node(edges, &node_ids),
+        }
+    }
+}
+
+/// Check that Loop nesting is well formed before anything runs: every parent is a Loop,
+/// every Loop contains at least one node, and edges stay inside one scope. The only edge
+/// allowed to cross is the Loop's own edge to a node directly inside it (the builder's
+/// "start" connector), which marks an entry point and is otherwise ignored.
+fn validate_loops(nodes: &[NodeSpec], edges: &[EdgeSpec]) -> Result<(), String> {
+    let by_id: HashMap<&str, &NodeSpec> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    for node in nodes {
+        let mut parent = node.parent.as_deref();
+        let mut depth = 0;
+        while let Some(p) = parent {
+            let parent_node = by_id
+                .get(p)
+                .ok_or_else(|| format!("node {} is inside unknown node {}", node.id, p))?;
+            if parent_node.node_type != LOOP_NODE_TYPE {
+                return Err(format!("node {} is inside {}, which is not a Loop", node.id, p));
+            }
+            depth += 1;
+            if depth > nodes.len() {
+                return Err(format!("node {} has circular parents", node.id));
+            }
+            parent = parent_node.parent.as_deref();
+        }
+        if node.node_type == LOOP_NODE_TYPE
+            && !nodes.iter().any(|c| c.parent.as_deref() == Some(node.id.as_str()))
+        {
+            return Err(format!("Loop {} has no nodes inside it", node.id));
+        }
+    }
+    for e in edges {
+        let (Some(source), Some(target)) = (by_id.get(e.source.as_str()), by_id.get(e.target.as_str())) else {
+            continue;
+        };
+        if source.parent == target.parent || target.parent.as_deref() == Some(source.id.as_str()) {
+            continue;
+        }
+        return Err(format!(
+            "edge {} -> {} crosses a Loop boundary: nodes inside a Loop can only connect to each other",
+            e.source, e.target
+        ));
+    }
+    Ok(())
+}
+
+/// Run one node, record its step and, at the top level, persist the execution context.
+/// Inside a loop only the step is written; the context is persisted once the whole Loop
+/// node finishes, so a long loop does not rewrite the full context per item.
+/// Returns the updated context and the node's output.
+async fn run_single_node(
+    env: &RunEnv<'_>,
     context: Value,
     last_output: Value,
     node: &NodeSpec,
-    trace_id: Option<&str>,
+    iteration: &[usize],
 ) -> Result<(Value, Value), String> {
-    let executor = node_registry
-        .get(&node.node_type)
-        .ok_or_else(|| format!("unknown node type: {}", node.node_type))?;
-
-    let mut exec_ctx = ExecutionContext::new(workflow_id, execution_id, context);
-    exec_ctx.trace_id = trace_id.map(str::to_string);
+    let mut exec_ctx = ExecutionContext::new(env.workflow_id, env.execution_id, context);
+    exec_ctx.trace_id = env.trace_id.map(str::to_string);
     exec_ctx.set_current(last_output);
-
-    let mut input = node.input.clone();
-    let mut config = node.config.clone();
-    tracing::debug!(
-        execution_id = %execution_id,
-        node_id = %node.id,
-        node_type = %node.node_type,
-        input_before = ?input,
-        config_before = ?config,
-        "interpolating node input and config"
-    );
-    expression::interpolate_value(&mut input, &exec_ctx.context).map_err(|e| e.to_string())?;
-    expression::interpolate_value(&mut config, &exec_ctx.context).map_err(|e| e.to_string())?;
-    tracing::debug!(
-        execution_id = %execution_id,
-        node_id = %node.id,
-        node_type = %node.node_type,
-        input_after = ?input,
-        config_after = ?config,
-        "interpolated node input and config"
-    );
+    let tag = iteration_tag(iteration);
+    let top_level = iteration.is_empty();
 
     tracing::info!(
-        execution_id = %execution_id,
+        execution_id = %env.execution_id,
         node_id = %node.id,
         node_type = %node.node_type,
+        iteration = %tag,
         "executing node"
     );
 
-    match executor
-        .execute(&exec_ctx, &node.id, input, config)
-        .await
-    {
+    let result = if node.node_type == LOOP_NODE_TYPE {
+        run_loop(env, &mut exec_ctx, node, iteration).await
+    } else {
+        match env.registry.get(&node.node_type) {
+            Some(executor) => execute_node(executor.as_ref(), &exec_ctx, node).await,
+            None => Err(format!("unknown node type: {}", node.node_type)),
+        }
+    };
+
+    match result {
         Ok(output) => {
             tracing::debug!(
-                execution_id = %execution_id,
+                execution_id = %env.execution_id,
                 node_id = %node.id,
                 node_type = %node.node_type,
                 output = ?output,
@@ -224,43 +293,207 @@ async fn run_single_node(
             }
             exec_ctx.set_node_output(&node.id, output.clone());
             let context = exec_ctx.context;
-            storage::update_execution(pool, execution_id, "running", &context, None)
-                .await
-                .map_err(|e| e.to_string())?;
-            storage::insert_step(pool, execution_id, &node.id, "completed", Some(&output), None)
+            if top_level {
+                storage::update_execution(env.pool, env.execution_id, "running", &context, None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            storage::insert_step(env.pool, env.execution_id, &node.id, &tag, "completed", Some(&output), None)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok((context, output))
         }
         Err(e) => {
             tracing::error!(
-                execution_id = %execution_id,
+                execution_id = %env.execution_id,
                 node_id = %node.id,
                 node_type = %node.node_type,
+                iteration = %tag,
                 error = %e,
                 "node execution failed"
             );
-            storage::update_execution(
-                pool,
-                execution_id,
-                "failed",
-                &exec_ctx.context,
-                Some(chrono::Utc::now()),
-            )
-            .await
-            .map_err(|e2| e2.to_string())?;
-            let _ = storage::insert_step(
-                pool,
-                execution_id,
-                &node.id,
-                "failed",
-                None,
-                Some(&e),
-            )
-            .await;
-            Err(e)
+            if top_level {
+                storage::update_execution(
+                    env.pool,
+                    env.execution_id,
+                    "failed",
+                    &exec_ctx.context,
+                    Some(chrono::Utc::now()),
+                )
+                .await
+                .map_err(|e2| e2.to_string())?;
+            }
+            let _ = storage::insert_step(env.pool, env.execution_id, &node.id, &tag, "failed", None, Some(&e)).await;
+            // Inside a loop, name the failing node so the Loop's error points at it.
+            Err(if top_level { e } else { format!("{}: {e}", node.id) })
         }
     }
+}
+
+/// Interpolate a node's input/config against its context and run it once.
+async fn execute_node(
+    executor: &dyn NodeExecutor,
+    exec_ctx: &ExecutionContext,
+    node: &NodeSpec,
+) -> Result<Value, String> {
+    let mut input = node.input.clone();
+    let mut config = node.config.clone();
+    tracing::debug!(
+        execution_id = %exec_ctx.execution_id,
+        node_id = %node.id,
+        node_type = %node.node_type,
+        input_before = ?input,
+        config_before = ?config,
+        "interpolating node input and config"
+    );
+    // One scope for both: converting the context is the expensive part.
+    if expression::has_expressions(&input) || expression::has_expressions(&config) {
+        let scope = expression::Scope::new(&exec_ctx.context)?;
+        expression::interpolate_value_in(&mut input, &scope)?;
+        expression::interpolate_value_in(&mut config, &scope)?;
+    }
+    tracing::debug!(
+        execution_id = %exec_ctx.execution_id,
+        node_id = %node.id,
+        node_type = %node.node_type,
+        input_after = ?input,
+        config_after = ?config,
+        "interpolated node input and config"
+    );
+    executor.execute(exec_ctx, &node.id, input, config).await
+}
+
+/// Resolve a Loop's `items` into the list to iterate. An expression that yields `null`
+/// (e.g. an absent field) is an empty list, so "no attachments" is not an error.
+fn resolve_items(config: &Value, context: &Value) -> Result<Vec<Value>, String> {
+    let mut items = match config.get("items") {
+        None => return Err("Loop needs `items`: an expression that returns a list".to_string()),
+        Some(Value::String(s)) if s.trim().is_empty() => {
+            return Err("Loop needs `items`: an expression that returns a list".to_string())
+        }
+        Some(v) => v.clone(),
+    };
+    expression::interpolate_value(&mut items, context)?;
+    match items {
+        Value::Array(list) => Ok(list),
+        Value::Null => Ok(Vec::new()),
+        other => Err(format!(
+            "Loop items must be a list, got {}",
+            match other {
+                Value::Object(_) => "an object",
+                Value::String(_) => "a string",
+                Value::Number(_) => "a number",
+                _ => "a boolean",
+            }
+        )),
+    }
+}
+
+/// Run a Loop node: its body (the nodes whose `parent` is this Loop) runs once per item,
+/// sequentially, stopping at the first failure.
+///
+/// Each iteration starts from the Loop's context plus `item` and `index` (the innermost
+/// loop wins when nested). Entry nodes of the body get `current` = the item, and
+/// `nodes.<id>` holds only that iteration's outputs. Changes to `local` carry over to
+/// later iterations and past the loop, so SetVariable can accumulate.
+///
+/// Output: `{ "count", "results": [ { "<body node id>": <output>, ... } per item ] }`.
+async fn run_loop(
+    env: &RunEnv<'_>,
+    exec_ctx: &mut ExecutionContext,
+    node: &NodeSpec,
+    iteration: &[usize],
+) -> Result<Value, String> {
+    let items = resolve_items(&node.config, &exec_ctx.context)?;
+    let body_ids: Vec<&str> = env
+        .nodes
+        .iter()
+        .filter(|n| n.parent.as_deref() == Some(node.id.as_str()))
+        .map(|n| n.id.as_str())
+        .collect();
+
+    let mut results = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        let mut context = exec_ctx.context.clone();
+        if let Value::Object(map) = &mut context {
+            map.insert("item".to_string(), item.clone());
+            map.insert("index".to_string(), Value::from(index));
+        }
+        let mut path = iteration.to_vec();
+        path.push(index);
+        let (context, _) = run_scope(env, Some(node.id.as_str()), context, item, &path)
+            .await
+            .map_err(|e| format!("item {index}: {e}"))?;
+
+        let outputs = context.get("nodes").and_then(Value::as_object);
+        let result: serde_json::Map<String, Value> = body_ids
+            .iter()
+            .filter_map(|id| outputs.and_then(|o| o.get(*id)).map(|v| (id.to_string(), v.clone())))
+            .collect();
+        results.push(Value::Object(result));
+        if let Some(local) = context.get("local").and_then(Value::as_object) {
+            merge_into_local(&mut exec_ctx.context, local);
+        }
+    }
+    Ok(serde_json::json!({ "count": results.len(), "results": results }))
+}
+
+type ScopeFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Value, Value), String>> + Send + 'a>>;
+
+/// Run the nodes of one scope (the top level, or a Loop body for one item) in topological
+/// order, skipping nodes on branches not taken. Returns the final context and last output.
+/// Boxed because Loop bodies recurse back into it.
+fn run_scope<'a>(
+    env: &'a RunEnv<'a>,
+    parent: Option<&'a str>,
+    mut context: Value,
+    mut last_output: Value,
+    iteration: &'a [usize],
+) -> ScopeFuture<'a> {
+    Box::pin(async move {
+        let graph = ScopeGraph::new(env.nodes, env.edges, parent);
+        let tag = iteration_tag(iteration);
+        for node_id in &graph.order {
+            let node = graph
+                .nodes_by_id
+                .get(node_id)
+                .ok_or_else(|| format!("node not found: {}", node_id))?;
+
+            // Skip nodes reachable only through a branch port that was not taken. The
+            // topological order guarantees every predecessor already ran or was skipped, so
+            // `nodes` holds all the branch decisions needed to route this node.
+            let reachable = {
+                let empty = serde_json::Map::new();
+                let node_outputs = context.get("nodes").and_then(Value::as_object).unwrap_or(&empty);
+                node_reachable(node_id, &graph.incoming, node_outputs)
+            };
+            if !reachable {
+                tracing::info!(
+                    execution_id = %env.execution_id,
+                    node_id = %node_id,
+                    node_type = %node.node_type,
+                    iteration = %tag,
+                    "skipping node (branch not taken)"
+                );
+                storage::insert_step(env.pool, env.execution_id, node_id, &tag, "skipped", None, None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                mark_skipped(&mut context, node_id);
+                continue;
+            }
+
+            // Merge nodes receive all predecessor outputs keyed by source node id; others get previous node output.
+            if node.node_type == "Merge" {
+                let preds = graph.pred.get(node_id).cloned().unwrap_or_default();
+                last_output = merged_predecessor_outputs(&context, &preds);
+            }
+            let (new_ctx, new_out) = run_single_node(env, context, last_output, node, iteration).await?;
+            context = new_ctx;
+            last_output = new_out;
+        }
+        Ok((context, last_output))
+    })
 }
 
 /// Record a node id as skipped in `context.skipped` (deduplicated). Skipped nodes
@@ -329,12 +562,16 @@ pub async fn run_workflow(
     trace_id: Option<String>,
 ) -> Result<Value, String> {
     let (node_specs, edge_specs) = definition::parse_workflow(definition)?;
-    let order = topological_order(&node_specs, &edge_specs);
-    let nodes_by_id: HashMap<String, &NodeSpec> =
-        node_specs.iter().map(|n| (n.id.clone(), n)).collect();
-    let node_ids: HashSet<String> = node_specs.iter().map(|n| n.id.clone()).collect();
-    let pred = predecessors_by_node(&edge_specs, &node_ids);
-    let incoming = incoming_edges_by_node(&edge_specs, &node_ids);
+    validate_loops(&node_specs, &edge_specs)?;
+    let env = RunEnv {
+        pool,
+        registry: node_registry.as_ref(),
+        workflow_id,
+        execution_id,
+        trace_id: trace_id.as_deref(),
+        nodes: &node_specs,
+        edges: &edge_specs,
+    };
 
     let mut context = initial_context;
     if !context.is_object() {
@@ -342,54 +579,7 @@ pub async fn run_workflow(
     }
     ensure_context_shape(&mut context);
 
-    let mut last_output = Value::Object(serde_json::Map::new());
-
-    for node_id in order {
-        let node = nodes_by_id
-            .get(&node_id)
-            .ok_or_else(|| format!("node not found: {}", node_id))?;
-
-        // Skip nodes reachable only through a branch port that was not taken. The
-        // topological order guarantees every predecessor already ran or was skipped, so
-        // `nodes` holds all the branch decisions needed to route this node.
-        let reachable = {
-            let empty = serde_json::Map::new();
-            let node_outputs = context.get("nodes").and_then(Value::as_object).unwrap_or(&empty);
-            node_reachable(&node_id, &incoming, node_outputs)
-        };
-        if !reachable {
-            tracing::info!(
-                execution_id = %execution_id,
-                node_id = %node_id,
-                node_type = %node.node_type,
-                "skipping node (branch not taken)"
-            );
-            storage::insert_step(pool, execution_id, &node_id, "skipped", None, None)
-                .await
-                .map_err(|e| e.to_string())?;
-            mark_skipped(&mut context, &node_id);
-            continue;
-        }
-
-        // Merge nodes receive all predecessor outputs keyed by source node id; others get previous node output.
-        if node.node_type == "Merge" {
-            let preds = pred.get(&node_id).cloned().unwrap_or_default();
-            last_output = merged_predecessor_outputs(&context, &preds);
-        }
-        let (new_ctx, new_out) = run_single_node(
-            pool,
-            node_registry.as_ref(),
-            workflow_id,
-            execution_id,
-            context,
-            last_output,
-            node,
-            trace_id.as_deref(),
-        )
-        .await?;
-        context = new_ctx;
-        last_output = new_out;
-    }
+    let (context, _) = run_scope(&env, None, context, Value::Object(serde_json::Map::new()), &[]).await?;
 
     storage::update_execution(
         pool,
@@ -481,12 +671,18 @@ pub async fn run_next_step(
     trace_id: Option<String>,
 ) -> Result<RunNextStepResult, String> {
     let (node_specs, edge_specs) = definition::parse_workflow(definition)?;
-    let order = topological_order(&node_specs, &edge_specs);
-    let node_ids: HashSet<String> = node_specs.iter().map(|n| n.id.clone()).collect();
-    let nodes_by_id: HashMap<String, &NodeSpec> =
-        node_specs.iter().map(|n| (n.id.clone(), n)).collect();
-    let pred = predecessors_by_node(&edge_specs, &node_ids);
-    let incoming = incoming_edges_by_node(&edge_specs, &node_ids);
+    validate_loops(&node_specs, &edge_specs)?;
+    let env = RunEnv {
+        pool,
+        registry: node_registry.as_ref(),
+        workflow_id,
+        execution_id,
+        trace_id: trace_id.as_deref(),
+        nodes: &node_specs,
+        edges: &edge_specs,
+    };
+    // A step is one top-level node; a Loop runs its whole body within its step.
+    let ScopeGraph { order, nodes_by_id, pred, incoming } = ScopeGraph::new(&node_specs, &edge_specs, None);
 
     let steps = storage::list_steps_by_execution(pool, execution_id)
         .await
@@ -494,6 +690,7 @@ pub async fn run_next_step(
     // A node is "resolved" once it has completed, failed, or been skipped.
     let mut resolved: HashSet<String> = steps
         .iter()
+        .filter(|s| s.iteration.is_empty())
         .filter(|s| s.status == "completed" || s.status == "failed" || s.status == "skipped")
         .map(|s| s.node_id.clone())
         .collect();
@@ -542,7 +739,7 @@ pub async fn run_next_step(
         if reachable {
             break candidate;
         }
-        storage::insert_step(pool, execution_id, &candidate, "skipped", None, None)
+        storage::insert_step(pool, execution_id, &candidate, "", "skipped", None, None)
             .await
             .map_err(|e| e.to_string())?;
         mark_skipped(&mut context, &candidate);
@@ -572,23 +769,14 @@ pub async fn run_next_step(
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
     };
 
-    let (new_context, _) = run_single_node(
-        pool,
-        node_registry.as_ref(),
-        workflow_id,
-        execution_id,
-        context,
-        last_output,
-        node,
-        trace_id.as_deref(),
-    )
-    .await?;
+    let (new_context, _) = run_single_node(&env, context, last_output, node, &[]).await?;
 
     let steps_after = storage::list_steps_by_execution(pool, execution_id)
         .await
         .map_err(|e| e.to_string())?;
     let completed_after: HashSet<String> = steps_after
         .iter()
+        .filter(|s| s.iteration.is_empty())
         .filter(|s| s.status == "completed" || s.status == "failed" || s.status == "skipped")
         .map(|s| s.node_id.clone())
         .collect();
@@ -724,5 +912,86 @@ mod tests {
         let mut outputs = outputs;
         outputs.insert("yes".to_string(), serde_json::json!({ "status": 200 }));
         assert!(node_reachable("join", &incoming, &outputs));
+    }
+
+    fn node(id: &str, node_type: &str, parent: Option<&str>) -> NodeSpec {
+        NodeSpec {
+            id: id.to_string(),
+            node_type: node_type.to_string(),
+            config: serde_json::json!({}),
+            input: serde_json::json!({}),
+            parent: parent.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn scope_graph_keeps_loop_bodies_out_of_the_parent_scope() {
+        let nodes = vec![
+            node("trigger", "HttpTrigger", None),
+            node("loop", "Loop", None),
+            node("upload", "ServiceCall", Some("loop")),
+            node("link", "ServiceCall", Some("loop")),
+            node("done", "HttpRequest", None),
+        ];
+        let edges = vec![
+            edge("trigger", "loop", None),
+            edge("loop", "upload", None),
+            edge("upload", "link", None),
+            edge("loop", "done", None),
+        ];
+        validate_loops(&nodes, &edges).unwrap();
+
+        let top = ScopeGraph::new(&nodes, &edges, None);
+        assert_eq!(top.order, ["trigger", "loop", "done"]);
+
+        let body = ScopeGraph::new(&nodes, &edges, Some("loop"));
+        assert_eq!(body.order, ["upload", "link"]);
+        // The Loop's "start" edge is not an incoming edge of the body entry node.
+        assert!(body.incoming["upload"].is_empty());
+        assert_eq!(body.pred["link"], ["upload"]);
+    }
+
+    #[test]
+    fn validate_loops_rejects_bad_nesting_and_crossing_edges() {
+        let err = |nodes: Vec<NodeSpec>, edges: Vec<EdgeSpec>| validate_loops(&nodes, &edges).unwrap_err();
+
+        assert!(err(vec![node("loop", "Loop", None)], vec![]).contains("no nodes inside"));
+        assert!(err(vec![node("a", "If", None), node("b", "ServiceCall", Some("a"))], vec![])
+            .contains("not a Loop"));
+        assert!(err(vec![node("b", "ServiceCall", Some("ghost"))], vec![]).contains("unknown node"));
+
+        let body = || vec![node("loop", "Loop", None), node("in", "ServiceCall", Some("loop")), node("out", "HttpRequest", None)];
+        assert!(err(body(), vec![edge("in", "out", None)]).contains("crosses a Loop boundary"));
+        assert!(err(body(), vec![edge("out", "in", None)]).contains("crosses a Loop boundary"));
+        // Back-edge from the body to its own Loop.
+        assert!(err(body(), vec![edge("in", "loop", None)]).contains("crosses a Loop boundary"));
+
+        // Nested loops are fine.
+        let nested = vec![
+            node("outer", "Loop", None),
+            node("inner", "Loop", Some("outer")),
+            node("call", "ServiceCall", Some("inner")),
+        ];
+        validate_loops(&nested, &[edge("outer", "inner", None), edge("inner", "call", None)]).unwrap();
+    }
+
+    #[test]
+    fn resolve_items_accepts_lists_and_null() {
+        let ctx = serde_json::json!({ "Webhook": { "body": { "files": [1, 2], "one": { "a": 1 } } } });
+        let items = |v: Value| resolve_items(&serde_json::json!({ "items": v }), &ctx);
+
+        assert_eq!(items("{{ Webhook.body.files }}".into()).unwrap(), [1, 2]);
+        assert!(items("{{ Webhook.body.missing }}".into()).unwrap().is_empty());
+        assert_eq!(items(serde_json::json!(["a"])).unwrap(), ["a"]);
+        assert!(items("{{ Webhook.body.one }}".into()).unwrap_err().contains("got an object"));
+        assert!(items("  ".into()).unwrap_err().contains("needs `items`"));
+        assert!(resolve_items(&serde_json::json!({}), &ctx).unwrap_err().contains("needs `items`"));
+    }
+
+    #[test]
+    fn iteration_tags_join_nested_indices() {
+        assert_eq!(iteration_tag(&[]), "");
+        assert_eq!(iteration_tag(&[3]), "3");
+        assert_eq!(iteration_tag(&[2, 1]), "2.1");
     }
 }

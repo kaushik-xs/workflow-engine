@@ -53,6 +53,8 @@ pub struct WorkflowStep {
     pub status: String,
     pub output: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// Loop iteration this step ran in ("0", "2.1" for nested loops); empty outside loops.
+    pub iteration: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -384,21 +386,23 @@ pub async fn insert_step(
     pool: &sqlx::PgPool,
     execution_id: Uuid,
     node_id: &str,
+    iteration: &str,
     status: &str,
     output: Option<&serde_json::Value>,
     error: Option<&str>,
 ) -> Result<WorkflowStep, sqlx::Error> {
     let row = sqlx::query_as::<_, WorkflowStep>(
         r#"
-        INSERT INTO workflow_steps (execution_id, node_id, status, output, error)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (execution_id, node_id) DO UPDATE
+        INSERT INTO workflow_steps (execution_id, node_id, iteration, status, output, error)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (execution_id, node_id, iteration) DO UPDATE
         SET status = EXCLUDED.status, output = EXCLUDED.output, error = EXCLUDED.error
-        RETURNING id, execution_id, node_id, status, output, error, created_at
+        RETURNING id, execution_id, node_id, status, output, error, iteration, created_at
         "#,
     )
     .bind(execution_id)
     .bind(node_id)
+    .bind(iteration)
     .bind(status)
     .bind(output)
     .bind(error)
@@ -413,7 +417,7 @@ pub async fn list_steps_by_execution(
 ) -> Result<Vec<WorkflowStep>, sqlx::Error> {
     let rows = sqlx::query_as::<_, WorkflowStep>(
         r#"
-        SELECT id, execution_id, node_id, status, output, error, created_at
+        SELECT id, execution_id, node_id, status, output, error, iteration, created_at
         FROM workflow_steps
         WHERE execution_id = $1
         ORDER BY created_at ASC

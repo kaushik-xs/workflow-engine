@@ -432,15 +432,51 @@ fn compiled_cache() -> &'static Mutex<HashMap<String, jmespath::Expression<'stat
     COMPILED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// A context converted to JMESPath's representation once, so that many expressions can be
+/// evaluated against it without re-converting the whole context for each one. Contexts can
+/// carry large payloads (e.g. base64 attachments in `Webhook.body`), so converting per
+/// expression dominated interpolation cost.
+///
+/// Cloning is cheap: the tree is reference-counted and shared.
+#[derive(Clone)]
+pub struct Scope {
+    root: Rcvar,
+}
+
+impl Scope {
+    pub fn new(context: &Value) -> Result<Self, String> {
+        let root = jmespath::Variable::from_serializable(context).map_err(|e| e.to_string())?;
+        Ok(Self { root: Rcvar::new(root) })
+    }
+
+    /// A copy of this scope with `key` set at the root (e.g. a loop's `item`). The existing
+    /// root entries are shared, not copied.
+    pub fn with(&self, key: &str, value: &Value) -> Result<Self, String> {
+        let mut map = match &*self.root {
+            jmespath::Variable::Object(map) => map.clone(),
+            _ => BTreeMap::new(),
+        };
+        let var = jmespath::Variable::from_serializable(value).map_err(|e| e.to_string())?;
+        map.insert(key.to_string(), Rcvar::new(var));
+        Ok(Self { root: Rcvar::new(jmespath::Variable::Object(map)) })
+    }
+}
+
 /// Evaluate a single JMESPath expression against context (JSON value).
 pub fn evaluate(expression: &str, context: &Value) -> Result<Value, String> {
+    evaluate_in(expression, &Scope::new(context)?)
+}
+
+/// Evaluate a single JMESPath expression against a prepared [`Scope`].
+pub fn evaluate_in(expression: &str, scope: &Scope) -> Result<Value, String> {
     let expr_str = expression.trim();
     tracing::debug!(expression = %expr_str, "evaluating jmespath expression");
 
     let expr = get_compiled(expr_str)?;
-    let json_str = serde_json::to_string(context).map_err(|e| e.to_string())?;
-    let variable = jmespath::Variable::from_json(&json_str).map_err(|e| e.to_string())?;
-    let result = expr.search(variable).map_err(|e| {
+    // `Expression::search` would re-convert the root (the crate's `Rcvar` pass-through needs
+    // the nightly-only `specialized` feature), so interpret the AST against it directly.
+    let mut jctx = jmespath::Context::new(expr.as_str(), runtime());
+    let result = jmespath::interpret(&scope.root, expr.as_ast(), &mut jctx).map_err(|e| {
         let msg = e.to_string();
         tracing::debug!(expression = %expr_str, error = %msg, "jmespath evaluation error");
         msg
@@ -518,6 +554,14 @@ pub fn find_expressions(s: &str) -> Vec<(usize, usize, String)> {
 
 /// Replace all {{ expr }} in a string with evaluated values from context.
 pub fn interpolate_string(s: &str, context: &Value) -> Result<String, String> {
+    if find_expressions(s).is_empty() {
+        return Ok(s.to_string());
+    }
+    interpolate_string_in(s, &Scope::new(context)?)
+}
+
+/// [`interpolate_string`] against a prepared [`Scope`].
+pub fn interpolate_string_in(s: &str, scope: &Scope) -> Result<String, String> {
     let places = find_expressions(s);
     if places.is_empty() {
         return Ok(s.to_string());
@@ -526,7 +570,7 @@ pub fn interpolate_string(s: &str, context: &Value) -> Result<String, String> {
     let mut last = 0;
     for (start, end, expr) in places {
         result.push_str(&s[last..start]);
-        let value = evaluate(&expr, context)?;
+        let value = evaluate_in(&expr, scope)?;
         if value.is_string() {
             result.push_str(value.as_str().unwrap_or(""));
         } else {
@@ -557,28 +601,47 @@ fn sole_expression(s: &str) -> Option<String> {
 /// structured fields. Strings with surrounding text (e.g. `"Bearer {{token}}"`) or multiple
 /// placeholders keep the string-splicing behaviour.
 pub fn interpolate_value(value: &mut Value, context: &Value) -> Result<(), String> {
+    // Only pay for building the scope when there is something to interpolate.
+    if !has_expressions(value) {
+        return Ok(());
+    }
+    interpolate_value_in(value, &Scope::new(context)?)
+}
+
+/// [`interpolate_value`] against a prepared [`Scope`].
+pub fn interpolate_value_in(value: &mut Value, scope: &Scope) -> Result<(), String> {
     match value {
         Value::String(s) => {
             if let Some(expr) = sole_expression(s) {
-                *value = evaluate(&expr, context)?;
+                *value = evaluate_in(&expr, scope)?;
             } else {
-                let new_s = interpolate_string(s, context)?;
+                let new_s = interpolate_string_in(s, scope)?;
                 *s = new_s;
             }
         }
         Value::Array(arr) => {
             for v in arr.iter_mut() {
-                interpolate_value(v, context)?;
+                interpolate_value_in(v, scope)?;
             }
         }
         Value::Object(map) => {
             for v in map.values_mut() {
-                interpolate_value(v, context)?;
+                interpolate_value_in(v, scope)?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Whether any string inside `value` contains a `{{ }}` placeholder.
+pub fn has_expressions(value: &Value) -> bool {
+    match value {
+        Value::String(s) => !find_expressions(s).is_empty(),
+        Value::Array(arr) => arr.iter().any(has_expressions),
+        Value::Object(map) => map.values().any(has_expressions),
+        _ => false,
+    }
 }
 
 /// Interpolate a raw JSON body template into a JSON string.
@@ -589,12 +652,17 @@ pub fn interpolate_value(value: &mut Value, context: &Value) -> Result<(), Strin
 /// not valid JSON before substitution (e.g. an unquoted `"count": {{ expr }}`), it falls back to flat
 /// string interpolation, which stringifies scalar results in place.
 pub fn interpolate_json_body(raw: &str, context: &Value) -> Result<String, String> {
+    interpolate_json_body_in(raw, &Scope::new(context)?)
+}
+
+/// [`interpolate_json_body`] against a prepared [`Scope`].
+pub fn interpolate_json_body_in(raw: &str, scope: &Scope) -> Result<String, String> {
     match serde_json::from_str::<Value>(raw) {
         Ok(mut v) => {
-            interpolate_value(&mut v, context)?;
+            interpolate_value_in(&mut v, scope)?;
             serde_json::to_string(&v).map_err(|e| e.to_string())
         }
-        Err(_) => interpolate_string(raw, context),
+        Err(_) => interpolate_string_in(raw, scope),
     }
 }
 
@@ -1116,5 +1184,42 @@ mod tests {
         let rendered = interpolate_json_body(raw, &ctx).unwrap();
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(parsed["count"], 7);
+    }
+
+    #[test]
+    fn scope_with_adds_root_key_and_keeps_existing() {
+        let base = Scope::new(&serde_json::json!({ "local": { "a": 1 }, "item": "old" })).unwrap();
+        let scoped = base.with("item", &serde_json::json!({ "name": "x.pdf" })).unwrap();
+        assert_eq!(evaluate_in("item.name", &scoped).unwrap(), serde_json::json!("x.pdf"));
+        assert_eq!(evaluate_in("local.a", &scoped).unwrap(), serde_json::json!(1));
+        // The original scope is untouched.
+        assert_eq!(evaluate_in("item", &base).unwrap(), serde_json::json!("old"));
+
+        let mut v = serde_json::json!({ "n": "{{ item.name }}", "s": "file {{ item.name }}" });
+        interpolate_value_in(&mut v, &scoped).unwrap();
+        assert_eq!(v, serde_json::json!({ "n": "x.pdf", "s": "file x.pdf" }));
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture bench_"]
+    fn bench_large_context() {
+        let big = "A".repeat(5 * 1024 * 1024);
+        let ctx = serde_json::json!({ "Webhook": { "body": { "attachments": [{ "contentBase64": big, "attachmentName": "a.pdf" }] } }, "local": { "t": 1 } });
+        let n = 50;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let json = serde_json::to_string(&ctx).unwrap();
+            let var = jmespath::Variable::from_json(&json).unwrap();
+            get_compiled("local.t").unwrap().search(var).unwrap();
+        }
+        println!("old (per expression string round-trip): {:?}/expr", t.elapsed() / n);
+        let t = std::time::Instant::now();
+        let scope = Scope::new(&ctx).unwrap();
+        println!("Scope::new: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            evaluate_in("local.t", &scope).unwrap();
+        }
+        println!("new (shared scope): {:?}/expr", t.elapsed() / n);
     }
 }

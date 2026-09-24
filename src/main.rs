@@ -103,6 +103,9 @@ struct StepItem {
     node_id: String,
     status: String,
     output: Option<serde_json::Value>,
+    /// Loop iteration ("0", "2.1" for nested loops); omitted outside loops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration: Option<String>,
 }
 
 const TENANT_HEADER: &str = "x-tenant-id";
@@ -461,7 +464,8 @@ async fn trigger_webhook(
         steps
             .into_iter()
             .rev()
-            .find(|s| s.status == "completed")
+            // Steps inside a loop are per-item detail; the loop's own step holds the result.
+            .find(|s| s.status == "completed" && s.iteration.is_empty())
             .and_then(|s| s.output)
     } else {
         None
@@ -692,6 +696,7 @@ async fn get_execution(
                 node_id: s.node_id,
                 status: s.status,
                 output: s.output,
+                iteration: Some(s.iteration).filter(|i| !i.is_empty()),
             })
             .collect(),
     }))
@@ -761,6 +766,7 @@ async fn run_next_step_handler(
                 node_id: s.node_id,
                 status: s.status,
                 output: s.output,
+                iteration: Some(s.iteration).filter(|i| !i.is_empty()),
             })
             .collect(),
     }))

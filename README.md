@@ -63,6 +63,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 - **SetVariable** – Writes into the workflow's `local` scope during execution (config: `variables` object, or a single `key`/`value`; values support `{{ }}`). Updated `{{ local.* }}` values are visible to downstream nodes and later steps.
 - **If** – Two-way conditional branch. Evaluates one condition and activates the `true` or `false` output port (config: `condition` as `{ left, operator, right }` or any truthy value, or top-level `left`/`operator`/`right`; optional `trueHandle`/`falseHandle` port labels).
 - **Switch** – Multi-way conditional branch over a `value` (config: `cases` array of `{ handle, value }` / `{ handle, operator, value }` / `{ handle, condition }`; `mode` `"first"` (default) or `"all"`; `default` handle when nothing matches).
+- **Loop** – Container that runs the nodes inside it once per item (config: `items`, an expression returning a list). See [Loops](#loops).
 
 ### Branching
 
@@ -74,8 +75,52 @@ nodes that sit only on a branch that was not taken are recorded as **`skipped`**
 everything downstream of them. A join reached from either branch (e.g. via a `Merge`) still
 runs. Supported operators: `eq`/`ne`, `gt`/`gte`/`lt`/`lte`, `contains`/`notContains`,
 `in`/`notIn`, `startsWith`/`endsWith`, `exists`/`empty` (comparisons coerce numeric strings;
-`{{ }}` expressions in the condition are interpolated before evaluation). Loops/cycles are
-not supported — workflows are DAGs.
+`{{ }}` expressions in the condition are interpolated before evaluation). Cycles are not
+supported — workflows are DAGs; repeat work with a [Loop](#loops).
+
+### Loops
+
+A `Loop` node is a container: nodes whose React Flow `parentId` is the Loop form its
+**body**, which runs once per element of `items`, sequentially. The body is its own small DAG:
+its entry nodes are the ones with no incoming edge from another body node, and If/Switch
+branching works inside it as usual.
+
+- Inside the body, `{{ item }}` is the current element and `{{ index }}` its 0-based position
+  (nested loops: the innermost wins). Entry nodes also get `current` = the item.
+  `nodes.<id>` holds only the current iteration's outputs.
+- `local` changes (SetVariable) carry over to later iterations and past the loop.
+- `items` resolving to `null` (e.g. a missing field) runs nothing; any other non-list is an error.
+- The first failure stops the loop and fails the Loop node, e.g.
+  `item 1: upload: formdata row 2 ("attachmentPath"): invalid base64 …`.
+- Output: `{ "count", "results": [ { "<body node id>": <output>, … } per item ] }`, so after
+  the loop use e.g. `{{ nodes.loop.results[*].upload.body.id }}`.
+
+Edges must stay inside one scope: body nodes connect only to each other, and the Loop's
+outgoing edges lead to what runs after all items. The one exception is an edge from the Loop
+to a node directly inside it (the builder's *start* connector), which is ignored. A Loop with
+no nodes inside, or an edge crossing the boundary, fails the execution before anything runs.
+
+Each body node run is its own step, tagged with `iteration` (`"0"`, `"1"`, … or `"2.1"` for
+nested loops) in `GET /executions/:id`. In step-by-step mode a Loop runs all its items in one
+step. The execution context is persisted once per Loop, not per item.
+
+```json
+{
+  "nodes": [
+    { "id": "loop", "type": "loop", "data": { "items": "{{ not_null(Webhook.body.attachments, `[]`) }}" } },
+    { "id": "upload", "type": "serviceCall", "parentId": "loop", "data": {
+        "method": "POST", "serviceSlug": "core", "path": "/api/v1/package/manufacturing_essential/ticket_attachments",
+        "bodyMode": "formdata",
+        "rawBody": [
+          { "key": "ticketId", "value": "{{ local.parentTicketId }}" },
+          { "key": "attachmentName", "value": "{{ item.attachmentName }}" },
+          { "key": "attachmentPath", "type": "file",
+            "value": "{{ {filename: item.attachmentName, contentType: item.fileType, base64: item.contentBase64} }}" }
+        ] } }
+  ],
+  "edges": []
+}
+```
 
 ### HTTP request bodies
 
@@ -146,6 +191,7 @@ The execution context exposes these roots:
 - `current` – the previous node's output.
 - `global` – the tenant's stored globals (see the `/globals` API), snapshotted at execution start. Reference as `{{ global.API_BASE }}`.
 - `local` – workflow-scoped variables. Reference as `{{ local.counter }}`.
+- `item` / `index` – inside a [Loop](#loops) body: the current element and its position.
 
 > The OS environment is **not** exposed to workflows. Anything that was previously read from `env` should be stored as a `global` (managed per tenant) or a `local` variable.
 
