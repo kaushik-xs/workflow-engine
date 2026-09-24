@@ -57,7 +57,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 ## Node types (initial)
 
 - **HttpTrigger** – Entry point; Webhook context is set by the HTTP layer.
-- **HttpRequest** – Calls an external HTTP API (config: `method`, `url` or `path`, optional `body`/`headers`).
+- **HttpRequest** – Calls an external HTTP API (config: `method`, `url` or `path`, optional `body`/`headers`/`bodyMode`; see [HTTP request bodies](#http-request-bodies)).
 - **ServiceCall** – Calls an internal service (config: `serviceSlug`, `operation`). Uses the registered service registry (stub `authrs` by default).
 - **WorkflowCall** – Runs another workflow as a nested execution and returns its response (config: `workflowId` or `workflow`/`workflowName` with optional `version`/`tenant`; payload via `rawBody`/`body`). Guarded against self-calls and cycles (max depth 10).
 - **SetVariable** – Writes into the workflow's `local` scope during execution (config: `variables` object, or a single `key`/`value`; values support `{{ }}`). Updated `{{ local.* }}` values are visible to downstream nodes and later steps.
@@ -76,6 +76,51 @@ runs. Supported operators: `eq`/`ne`, `gt`/`gte`/`lt`/`lte`, `contains`/`notCont
 `in`/`notIn`, `startsWith`/`endsWith`, `exists`/`empty` (comparisons coerce numeric strings;
 `{{ }}` expressions in the condition are interpolated before evaluation). Loops/cycles are
 not supported — workflows are DAGs.
+
+### HTTP request bodies
+
+`HttpRequest` encodes `body` according to the optional `bodyMode`:
+
+| `bodyMode` | `body` | Sent as |
+|---|---|---|
+| *(omitted)* | object / array / string | JSON for objects and arrays; strings as-is. Default `Content-Type: application/json` (unchanged behaviour). |
+| `none` | ignored | No body. |
+| `raw` | string | The string as-is. Default `Content-Type: text/plain`. |
+| `formdata` | array of rows | `multipart/form-data` (aliases: `form-data`, `multipart`). |
+
+A `Content-Type` in `headers` always wins over the defaults above, and is sent once. The
+exception is `formdata`: the engine generates the boundary, so it sets
+`multipart/form-data; boundary=…` itself and ignores any `Content-Type` you provide.
+
+`formdata` rows follow Postman's shape — `{ "key", "type": "text" | "file", "value", "disabled"? }`
+(`type` defaults to `text`), sent in row order:
+
+- **text** – a string, number or boolean sends one part. An array sends **one part per
+  element** under the same key, so `{{ list[*].field }}` loops without templating.
+  `null` sends nothing.
+- **file** – an object `{ "base64", "filename"?, "contentType"? }` or an array of them (one
+  part each). The base64 is decoded, so the server receives the real bytes. Whitespace,
+  missing padding and a `data:<type>;base64,` prefix are tolerated. `contentType` defaults
+  to `application/octet-stream`.
+
+```json
+{
+  "type": "httpRequest",
+  "config": {
+    "method": "POST",
+    "url": "https://api.example.com/tickets/attachments",
+    "bodyMode": "formdata",
+    "body": [
+      { "key": "ticketId", "type": "text", "value": "{{ local.parentTicketId }}" },
+      { "key": "attachmentName", "type": "text", "value": "{{ not_null(Webhook.body.attachments, Webhook.body.ticketAttachments, `[]`)[*].attachmentName }}" },
+      { "key": "attachmentPath", "type": "file", "value": "{{ not_null(Webhook.body.attachments, Webhook.body.ticketAttachments, `[]`)[*].{filename: attachmentName, contentType: fileType, base64: contentBase64} }}" }
+    ]
+  }
+}
+```
+
+In the step output, `request.body` lists the parts sent. File parts show their `filename`,
+`contentType` and `size` in place of the content.
 
 ## Step-by-step execution (debug mode)
 
