@@ -1,6 +1,7 @@
 use crate::definition::{self, EdgeSpec, NodeSpec};
 use crate::expression;
 use crate::nodes::NodeExecutor;
+use crate::persistence::Recorder;
 use crate::registry::NodeRegistry;
 use crate::storage;
 use serde_json::Value;
@@ -162,7 +163,7 @@ const LOOP_NODE_TYPE: &str = "Loop";
 
 /// What every node run needs besides the evolving context.
 struct RunEnv<'a> {
-    pool: &'a sqlx::PgPool,
+    recorder: &'a Recorder,
     registry: &'a dyn NodeRegistry,
     workflow_id: Uuid,
     execution_id: Uuid,
@@ -241,9 +242,10 @@ fn validate_loops(nodes: &[NodeSpec], edges: &[EdgeSpec]) -> Result<(), String> 
     Ok(())
 }
 
-/// Run one node, record its step and, at the top level, persist the execution context.
-/// Inside a loop only the step is written; the context is persisted once the whole Loop
-/// node finishes, so a long loop does not rewrite the full context per item.
+/// Run one node, record its step and, at the top level, record the execution context.
+/// Inside a loop only the step is recorded; the context is saved once the whole Loop
+/// node finishes, so a long loop does not rewrite the full context per item. What is
+/// actually written depends on the run's persistence mode (see [`Recorder`]).
 /// Returns the updated context and the node's output.
 async fn run_single_node(
     env: &RunEnv<'_>,
@@ -294,13 +296,9 @@ async fn run_single_node(
             exec_ctx.set_node_output(&node.id, output.clone());
             let context = exec_ctx.context;
             if top_level {
-                storage::update_execution(env.pool, env.execution_id, "running", &context, None)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                env.recorder.progress(&context).await?;
             }
-            storage::insert_step(env.pool, env.execution_id, &node.id, &tag, "completed", Some(&output), None)
-                .await
-                .map_err(|e| e.to_string())?;
+            env.recorder.step(&node.id, &tag, "completed", Some(&output), None).await?;
             Ok((context, output))
         }
         Err(e) => {
@@ -312,18 +310,11 @@ async fn run_single_node(
                 error = %e,
                 "node execution failed"
             );
+            let _ = env.recorder.step(&node.id, &tag, "failed", None, Some(&e)).await;
+            // Record the failure after its step, so `errors_only` mode writes that step too.
             if top_level {
-                storage::update_execution(
-                    env.pool,
-                    env.execution_id,
-                    "failed",
-                    &exec_ctx.context,
-                    Some(chrono::Utc::now()),
-                )
-                .await
-                .map_err(|e2| e2.to_string())?;
+                env.recorder.fail(&exec_ctx.context).await?;
             }
-            let _ = storage::insert_step(env.pool, env.execution_id, &node.id, &tag, "failed", None, Some(&e)).await;
             // Inside a loop, name the failing node so the Loop's error points at it.
             Err(if top_level { e } else { format!("{}: {e}", node.id) })
         }
@@ -476,9 +467,7 @@ fn run_scope<'a>(
                     iteration = %tag,
                     "skipping node (branch not taken)"
                 );
-                storage::insert_step(env.pool, env.execution_id, node_id, &tag, "skipped", None, None)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                env.recorder.step(node_id, &tag, "skipped", None, None).await?;
                 mark_skipped(&mut context, node_id);
                 continue;
             }
@@ -551,23 +540,41 @@ fn merged_predecessor_outputs(context: &Value, preds: &[String]) -> Value {
     Value::Object(map)
 }
 
-/// Run workflow to completion (or first failure). Updates execution and steps in DB.
+/// A workflow run that completed.
+#[derive(Debug)]
+pub struct WorkflowRun {
+    /// Final execution context.
+    pub context: Value,
+    /// The workflow's response: the output of the last top-level node that ran, or `None`
+    /// when no node ran. This is what the webhook trigger returns.
+    pub result: Option<Value>,
+}
+
+/// Run workflow to completion (or first failure), recording the execution and its steps
+/// through `recorder` according to its persistence mode.
 pub async fn run_workflow(
-    pool: &sqlx::PgPool,
+    recorder: &Recorder,
     node_registry: Arc<dyn NodeRegistry>,
-    workflow_id: Uuid,
-    execution_id: Uuid,
     definition: &Value,
     initial_context: Value,
     trace_id: Option<String>,
-) -> Result<Value, String> {
-    let (node_specs, edge_specs) = definition::parse_workflow(definition)?;
-    validate_loops(&node_specs, &edge_specs)?;
+) -> Result<WorkflowRun, String> {
+    let parsed = definition::parse_workflow(definition)
+        .and_then(|(nodes, edges)| validate_loops(&nodes, &edges).map(|_| (nodes, edges)));
+    let (node_specs, edge_specs) = match parsed {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            if let Err(e2) = recorder.fail(&initial_context).await {
+                tracing::error!(execution_id = %recorder.execution_id(), error = %e2, "failed to record execution failure");
+            }
+            return Err(e);
+        }
+    };
     let env = RunEnv {
-        pool,
+        recorder,
         registry: node_registry.as_ref(),
-        workflow_id,
-        execution_id,
+        workflow_id: recorder.workflow_id(),
+        execution_id: recorder.execution_id(),
         trace_id: trace_id.as_deref(),
         nodes: &node_specs,
         edges: &edge_specs,
@@ -579,18 +586,18 @@ pub async fn run_workflow(
     }
     ensure_context_shape(&mut context);
 
-    let (context, _) = run_scope(&env, None, context, Value::Object(serde_json::Map::new()), &[]).await?;
+    let (context, last_output) =
+        run_scope(&env, None, context, Value::Object(serde_json::Map::new()), &[]).await?;
 
-    storage::update_execution(
-        pool,
-        execution_id,
-        "completed",
-        &context,
-        Some(chrono::Utc::now()),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(context)
+    recorder.complete(&context).await?;
+    let any_ran = context
+        .get("nodes")
+        .and_then(Value::as_object)
+        .is_some_and(|n| !n.is_empty());
+    Ok(WorkflowRun {
+        result: any_ran.then_some(last_output),
+        context,
+    })
 }
 
 /// Predecessors: for each node_id, the set of node ids that must complete before it (sources of edges targeting it).
@@ -672,8 +679,10 @@ pub async fn run_next_step(
 ) -> Result<RunNextStepResult, String> {
     let (node_specs, edge_specs) = definition::parse_workflow(definition)?;
     validate_loops(&node_specs, &edge_specs)?;
+    // Step mode always saves everything: each step reloads its state from the database.
+    let recorder = Recorder::existing(pool, execution_id, workflow_id);
     let env = RunEnv {
-        pool,
+        recorder: &recorder,
         registry: node_registry.as_ref(),
         workflow_id,
         execution_id,

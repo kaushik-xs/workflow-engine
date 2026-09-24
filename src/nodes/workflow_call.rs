@@ -1,6 +1,6 @@
 //! Workflow Call node: invokes another workflow and returns its response as this
 //! node's output. The called workflow runs as a child execution (its own row in
-//! `workflow_executions`), and this node's output is the child's final response —
+//! `workflow_executions`, saved according to the child workflow's `persistence` mode), and this node's output is the child's final response —
 //! the same value a webhook trigger would return for that workflow.
 //!
 //! Config keys (in node `data`):
@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::executor;
 use crate::expression;
+use crate::persistence::{Persistence, Recorder};
 use crate::registry::NodeRegistry;
 use crate::storage;
 
@@ -169,32 +170,33 @@ impl NodeExecutor for WorkflowCallExecutor {
             .upgrade()
             .ok_or("WorkflowCall: node registry is unavailable")?;
 
-        // Create a child execution row for the sub-workflow run.
-        let sub_exec = storage::create_execution(
+        // The sub-workflow is recorded as its own execution, under its own persistence mode.
+        let persistence = Persistence::from_definition(&workflow.definition)
+            .map_err(|e| format!("WorkflowCall: {e}"))?;
+        let recorder = Recorder::start(
             self.pool.as_ref(),
+            persistence,
             workflow.id,
             Some(workflow.version),
             &initial_context,
-            None,
         )
         .await
         .map_err(|e| e.to_string())?;
+        let sub_execution_id = recorder.execution_id();
 
         tracing::info!(
             execution_id = %ctx.execution_id,
             node_type = "workflowCall",
             sub_workflow_id = %workflow.id,
             sub_workflow_name = %workflow.name,
-            sub_execution_id = %sub_exec.id,
+            sub_execution_id = %sub_execution_id,
             depth = depth,
             "calling workflow"
         );
 
-        executor::run_workflow(
-            self.pool.as_ref(),
+        let run = executor::run_workflow(
+            &recorder,
             registry,
-            workflow.id,
-            sub_exec.id,
             &workflow.definition,
             initial_context,
             // Sub-workflow runs in-process under the same trace as its parent.
@@ -202,17 +204,9 @@ impl NodeExecutor for WorkflowCallExecutor {
         )
         .await?;
 
-        // The workflow "response" is the last completed step's output — the same value
+        // The workflow "response" is its last top-level node's output — the same value
         // the webhook trigger returns for a workflow.
-        let steps = storage::list_steps_by_execution(self.pool.as_ref(), sub_exec.id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let response = steps
-            .into_iter()
-            .rev()
-            .find(|s| s.status == "completed")
-            .and_then(|s| s.output)
-            .unwrap_or(Value::Null);
+        let response = run.result.unwrap_or(Value::Null);
 
         // Surface the inner body/status so downstream Merge/expression nodes read a
         // consistent `{status, body}` shape.
@@ -225,7 +219,7 @@ impl NodeExecutor for WorkflowCallExecutor {
         tracing::debug!(
             execution_id = %ctx.execution_id,
             node_type = "workflowCall",
-            sub_execution_id = %sub_exec.id,
+            sub_execution_id = %sub_execution_id,
             status = status,
             response_body = ?response_body,
             "workflow call completed"
@@ -234,7 +228,7 @@ impl NodeExecutor for WorkflowCallExecutor {
         Ok(serde_json::json!({
             "status": status,
             "body": response_body,
-            "execution_id": sub_exec.id,
+            "execution_id": sub_execution_id,
             "request": request
         }))
     }

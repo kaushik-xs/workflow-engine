@@ -4,6 +4,7 @@ pub mod executor;
 pub mod expression;
 pub mod logging;
 pub mod nodes;
+pub mod persistence;
 pub mod registry;
 pub mod storage;
 pub mod trace;

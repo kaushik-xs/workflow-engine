@@ -282,6 +282,63 @@ pub async fn create_execution(
     Ok(row)
 }
 
+/// A step held in memory until its run is written out (see `executor::Recorder`).
+#[derive(Debug, Clone)]
+pub struct StepRecord {
+    pub node_id: String,
+    pub iteration: String,
+    pub status: String,
+    pub output: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Write a whole finished execution and its steps in one transaction. Used when a run
+/// was kept in memory and only saved once it failed. Steps keep the time they ran at,
+/// so they list in the order they happened.
+pub async fn insert_finished_execution(
+    pool: &sqlx::PgPool,
+    execution: &WorkflowExecution,
+    steps: &[StepRecord],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"
+        INSERT INTO workflow_executions (id, workflow_id, workflow_version, status, context, started_at, finished_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(execution.id)
+    .bind(execution.workflow_id)
+    .bind(execution.workflow_version)
+    .bind(&execution.status)
+    .bind(&execution.context)
+    .bind(execution.started_at)
+    .bind(execution.finished_at)
+    .execute(&mut *tx)
+    .await?;
+    for s in steps {
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_steps (execution_id, node_id, iteration, status, output, error, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (execution_id, node_id, iteration) DO UPDATE
+            SET status = EXCLUDED.status, output = EXCLUDED.output, error = EXCLUDED.error
+            "#,
+        )
+        .bind(execution.id)
+        .bind(&s.node_id)
+        .bind(&s.iteration)
+        .bind(&s.status)
+        .bind(&s.output)
+        .bind(&s.error)
+        .bind(s.created_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
 pub async fn update_execution(
     pool: &sqlx::PgPool,
     id: Uuid,

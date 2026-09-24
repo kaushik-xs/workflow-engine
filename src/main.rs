@@ -13,6 +13,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 use workflow_engine::error::AppError;
 use workflow_engine::executor;
+use workflow_engine::persistence::{Persistence, Recorder};
 use workflow_engine::registry::{DefaultNodeRegistry, NodeRegistry};
 use workflow_engine::storage;
 use workflow_engine::triggers;
@@ -355,6 +356,8 @@ struct WebhookQuery {
     version: Option<i32>,
     #[serde(rename = "step")]
     step: Option<bool>,
+    /// Overrides the workflow's `persistence` for this call: `full`, `errors_only` or `none`.
+    persist: Option<String>,
 }
 
 /// Maximum number of executions returnable in a single page.
@@ -413,18 +416,23 @@ async fn trigger_webhook(
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
     let step_mode = query.step == Some(true);
-    let initial_status = if step_mode { Some("paused") } else { None };
-    let exec = storage::create_execution(
-        &state.pool,
-        workflow.id,
-        Some(workflow.version),
-        &initial_context,
-        initial_status,
-    )
-    .await
-    .map_err(AppError::from)?;
+    let persistence = match query.persist.as_deref() {
+        Some(p) => Persistence::parse(p),
+        None => Persistence::from_definition(&workflow.definition),
+    }
+    .map_err(AppError::BadRequest)?;
 
     if step_mode {
+        // Step mode reloads state from the database between steps, so it is always saved.
+        let exec = storage::create_execution(
+            &state.pool,
+            workflow.id,
+            Some(workflow.version),
+            &initial_context,
+            Some("paused"),
+        )
+        .await
+        .map_err(AppError::from)?;
         return Ok(Json(WebhookResponse {
             execution_id: exec.id,
             status: "paused".to_string(),
@@ -433,19 +441,27 @@ async fn trigger_webhook(
         }));
     }
 
+    let recorder = Recorder::start(
+        &state.pool,
+        persistence,
+        workflow.id,
+        Some(workflow.version),
+        &initial_context,
+    )
+    .await
+    .map_err(AppError::from)?;
+
     // Continue the caller's trace (from the incoming `traceparent`), or start a root.
     let trace_id = workflow_engine::trace::resolve_trace_id(&headers);
     let span = tracing::info_span!(
         "execution",
         trace_id = %trace_id,
-        execution_id = %exec.id,
+        execution_id = %recorder.execution_id(),
         workflow_id = %workflow.id,
     );
-    let result = executor::run_workflow(
-        &state.pool,
+    let run = executor::run_workflow(
+        &recorder,
         state.node_registry.clone(),
-        workflow.id,
-        exec.id,
         &workflow.definition,
         initial_context,
         Some(trace_id.clone()),
@@ -453,28 +469,15 @@ async fn trigger_webhook(
     .instrument(span)
     .await;
 
-    let (status, error) = match &result {
-        Ok(_) => ("completed", None),
-        Err(e) => ("failed", Some(e.clone())),
-    };
-    let result_body = if status == "completed" {
-        let steps = storage::list_steps_by_execution(&state.pool, exec.id)
-            .await
-            .map_err(AppError::from)?;
-        steps
-            .into_iter()
-            .rev()
-            // Steps inside a loop are per-item detail; the loop's own step holds the result.
-            .find(|s| s.status == "completed" && s.iteration.is_empty())
-            .and_then(|s| s.output)
-    } else {
-        None
+    let (status, result, error) = match run {
+        Ok(run) => ("completed", run.result, None),
+        Err(e) => ("failed", None, Some(e)),
     };
 
     Ok(Json(WebhookResponse {
-        execution_id: exec.id,
+        execution_id: recorder.execution_id(),
         status: status.to_string(),
-        result: result_body,
+        result,
         error,
     }))
 }

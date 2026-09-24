@@ -38,7 +38,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 | GET | /workflows/:id | Get workflow by id (includes `version`, `is_latest`) |
 | PUT | /workflows/:id | Update workflow (body: `{ "definition"?, "is_latest"? }`; set `is_latest: true` to mark as latest for that name) |
 | DELETE | /workflows/:id | Delete workflow by id. Also deletes all of the workflow's executions and their steps (cascade). Returns `{ "id", "deleted": true }`. |
-| POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name; optional `?step=true` for step-by-step (debug) mode. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
+| POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name; optional `?step=true` for step-by-step (debug) mode; optional `?persist=full|errors_only|none` overrides the workflow's persistence for this call. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
 | GET | /executions/:id | Get execution (includes `workflow_version` that was run) |
 | POST | /executions/:id/step | Run the next step for a paused execution (step-by-step mode). Returns the execution with updated status and steps. |
 | GET | /globals | List the tenant's globals (requires **X-Tenant-ID**). Returns `{ "globals": [{ "key", "value", "created_at", "updated_at" }] }`. |
@@ -167,6 +167,22 @@ exception is `formdata`: the engine generates the boundary, so it sets
 
 In the step output, `request.body` lists the parts sent. File parts show their `filename`,
 `contentType` and `size` in place of the content.
+
+## Saving executions (persistence)
+
+Each workflow chooses how much of a run is saved to `workflow_executions` / `workflow_steps`, with `persistence` in its definition (`data.persistence`, or top-level `persistence`):
+
+| Mode | Successful run | Failed run |
+|------|----------------|------------|
+| `errors_only` (default) | Nothing saved | Execution (status `failed`, context at the failure) and every step up to the failure: completed outputs, skipped branches and the failed step's error |
+| `full` | Execution and all steps, written as the run goes | Same, as the run goes |
+| `none` | Nothing saved | Nothing saved |
+
+```json
+{ "data": { "persistence": "full", "nodes": [...], "edges": [...] } }
+```
+
+A webhook call can override it with `?persist=full` (e.g. to inspect a run in the executions view). The webhook response always includes `execution_id` and `result`, but when nothing was saved that id is not in `GET /executions`. Step mode (`?step=true`) is always saved in full. A `WorkflowCall` child is saved according to the child workflow's own mode.
 
 ## Step-by-step execution (debug mode)
 
