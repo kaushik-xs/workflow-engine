@@ -339,7 +339,15 @@ async fn execute_node(
     );
     // One scope for both: converting the context is the expensive part.
     if expression::has_expressions(&input) || expression::has_expressions(&config) {
-        let scope = expression::Scope::new(&exec_ctx.context)?;
+        let mut scope = expression::Scope::new(&exec_ctx.context)?;
+        // A node expanded from a template reads its params as `params.*`. Param values may
+        // themselves be expressions, evaluated against the workflow's context first.
+        if let Some(params) = &node.params {
+            let mut params = params.clone();
+            expression::interpolate_value_in(&mut params, &scope)
+                .map_err(|e| format!("template params: {e}"))?;
+            scope = scope.with("params", &params)?;
+        }
         expression::interpolate_value_in(&mut input, &scope)?;
         expression::interpolate_value_in(&mut config, &scope)?;
     }
@@ -930,7 +938,35 @@ mod tests {
             config: serde_json::json!({}),
             input: serde_json::json!({}),
             parent: parent.map(str::to_string),
+            params: None,
         }
+    }
+
+    struct EchoConfig;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for EchoConfig {
+        async fn execute(&self, _: &ExecutionContext, _: &str, _: Value, config: Value) -> Result<Value, String> {
+            Ok(config)
+        }
+    }
+
+    #[tokio::test]
+    async fn template_params_are_interpolated_then_exposed_to_config() {
+        let mut spec = node("t", "ServiceCall", None);
+        spec.config = serde_json::json!({
+            "rawBody": { "id": "{{ params.id }}", "priority": "{{ params.priority }}" },
+            "path": "/tickets/{{ params.id }}"
+        });
+        spec.params = Some(serde_json::json!({ "id": "{{ Webhook.body.id }}", "priority": "high" }));
+        let ctx = ExecutionContext::new(
+            Uuid::nil(),
+            Uuid::nil(),
+            serde_json::json!({ "Webhook": { "body": { "id": 42 } } }),
+        );
+        let out = execute_node(&EchoConfig, &ctx, &spec).await.unwrap();
+        assert_eq!(out["rawBody"], serde_json::json!({ "id": 42, "priority": "high" }));
+        assert_eq!(out["path"], "/tickets/42");
     }
 
     #[test]

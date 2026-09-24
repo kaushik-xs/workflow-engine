@@ -16,6 +16,7 @@ use workflow_engine::executor;
 use workflow_engine::persistence::{Persistence, Recorder};
 use workflow_engine::registry::{DefaultNodeRegistry, NodeRegistry};
 use workflow_engine::storage;
+use workflow_engine::templates;
 use workflow_engine::triggers;
 
 #[derive(Clone)]
@@ -159,6 +160,13 @@ async fn main() -> Result<(), anyhow::Error> {
         .route("/executions/latest-input", get(latest_execution_input))
         .route("/executions/:id", get(get_execution))
         .route("/executions/:id/step", post(run_next_step_handler))
+        .route("/node-templates", get(list_node_templates).post(create_node_template))
+        .route(
+            "/node-templates/:slug",
+            get(get_node_template).put(publish_node_template).delete(delete_node_template),
+        )
+        .route("/node-templates/:slug/versions", get(list_node_template_versions))
+        .route("/node-templates/:slug/usages", get(list_node_template_usages))
         .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state);
@@ -212,7 +220,13 @@ async fn create_workflow(
         ));
     }
 
+    let usages = templates::validate_workflow(&state.pool, &tenant, &definition)
+        .await
+        .map_err(AppError::BadRequest)?;
     let w = storage::create_workflow(&state.pool, &tenant, &name, version, &definition)
+        .await
+        .map_err(AppError::from)?;
+    storage::replace_template_usages(&state.pool, w.id, &w.tenant, &usages)
         .await
         .map_err(AppError::from)?;
     Ok((
@@ -297,6 +311,18 @@ async fn update_workflow(
     let definition = body.get("definition").cloned();
     let is_latest = body.get("is_latest").and_then(|v| v.as_bool());
     let definition_ref = definition.as_ref();
+    // Re-check template references whenever what they resolve against changes.
+    let usages = if definition.is_some() || tenant.is_some() {
+        let def = definition_ref.unwrap_or(&w.definition);
+        let t = tenant.unwrap_or(&w.tenant);
+        Some(
+            templates::validate_workflow(&state.pool, t, def)
+                .await
+                .map_err(AppError::BadRequest)?,
+        )
+    } else {
+        None
+    };
     let updated = storage::update_workflow(
         &state.pool,
         id,
@@ -307,6 +333,11 @@ async fn update_workflow(
     .await
     .map_err(AppError::from)?
     .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
+    if let Some(usages) = usages {
+        storage::replace_template_usages(&state.pool, updated.id, &updated.tenant, &usages)
+            .await
+            .map_err(AppError::from)?;
+    }
     Ok(Json(serde_json::json!({
         "id": updated.id,
         "tenant": updated.tenant,
@@ -407,7 +438,7 @@ async fn trigger_webhook(
     let webhook_context = triggers::webhook_context_from_request(body, &headers);
     // Snapshot the tenant's globals and seed the workflow's declared local variables into
     // the persisted execution context (used by both immediate and step-mode runs).
-    let initial_context = executor::build_initial_context(
+    let mut initial_context = executor::build_initial_context(
         &state.pool,
         &workflow.tenant,
         &workflow.definition,
@@ -421,6 +452,39 @@ async fn trigger_webhook(
         None => Persistence::from_definition(&workflow.definition),
     }
     .map_err(AppError::BadRequest)?;
+
+    // Expand template references now; the versions used are recorded in the context.
+    let resolved =
+        templates::resolve_definition(&state.pool, &workflow.tenant, &workflow.definition, None).await;
+    let definition = match resolved {
+        Ok(resolved) => {
+            templates::record_lock(&mut initial_context, resolved.lock);
+            resolved.definition
+        }
+        Err(e) if step_mode => return Err(AppError::BadRequest(e)),
+        Err(e) => {
+            // Record it like any other failure that stops a run before its first node.
+            let recorder = Recorder::start(
+                &state.pool,
+                persistence,
+                workflow.id,
+                Some(workflow.version),
+                &initial_context,
+            )
+            .await
+            .map_err(AppError::from)?;
+            recorder
+                .fail(&initial_context)
+                .await
+                .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+            return Ok(Json(WebhookResponse {
+                execution_id: recorder.execution_id(),
+                status: "failed".to_string(),
+                result: None,
+                error: Some(e),
+            }));
+        }
+    };
 
     if step_mode {
         // Step mode reloads state from the database between steps, so it is always saved.
@@ -462,7 +526,7 @@ async fn trigger_webhook(
     let run = executor::run_workflow(
         &recorder,
         state.node_registry.clone(),
-        &workflow.definition,
+        &definition,
         initial_context,
         Some(trace_id.clone()),
     )
@@ -733,6 +797,16 @@ async fn run_next_step_handler(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::NotFound("workflow not found".into()))?;
 
+    // Resolve templates to the versions this run started with, even if newer ones exist.
+    let resolved = templates::resolve_definition(
+        &state.pool,
+        &workflow.tenant,
+        &workflow.definition,
+        exec.context.get(templates::LOCK_CONTEXT_KEY),
+    )
+    .await
+    .map_err(AppError::BadRequest)?;
+
     let trace_id = workflow_engine::trace::resolve_trace_id(&headers);
     let span = tracing::info_span!("execution", trace_id = %trace_id, execution_id = %id);
     let _ = executor::run_next_step(
@@ -740,7 +814,7 @@ async fn run_next_step_handler(
         state.node_registry.clone(),
         id,
         exec.workflow_id,
-        &workflow.definition,
+        &resolved.definition,
         exec.context,
         Some(trace_id.clone()),
     )
@@ -773,4 +847,215 @@ async fn run_next_step_handler(
             })
             .collect(),
     }))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct NodeTemplateQuery {
+    version: Option<i32>,
+    /// List every version instead of only the latest of each template.
+    all_versions: Option<bool>,
+    /// Publish even if nodes following the latest version would lack a new required param.
+    force: Option<bool>,
+}
+
+fn node_template_json(t: &storage::NodeTemplate) -> serde_json::Value {
+    serde_json::json!({
+        "id": t.id,
+        "slug": t.slug,
+        "version": t.version,
+        "is_latest": t.is_latest,
+        "name": t.name,
+        "description": t.description,
+        "node_type": t.node_type,
+        "config": t.config,
+        "params": t.params,
+        "created_at": t.created_at.to_rfc3339(),
+    })
+}
+
+/// Read a template's editable content from a request body. `type`/`data` are accepted as
+/// aliases of `node_type`/`config`, so a React Flow node's fields can be sent as they are.
+fn node_template_content(body: &serde_json::Value) -> Result<storage::NodeTemplateContent, AppError> {
+    let text = |key: &str| {
+        body.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let node_type = text("node_type")
+        .or_else(|| text("type"))
+        .ok_or_else(|| AppError::BadRequest("node_type is required".into()))?;
+    let config = body
+        .get("config")
+        .or_else(|| body.get("data"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(storage::NodeTemplateContent {
+        name: text("name"),
+        description: text("description"),
+        node_type,
+        config,
+        params: body.get("params").cloned().unwrap_or_else(|| serde_json::json!({})),
+    })
+}
+
+async fn list_node_templates(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<NodeTemplateQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let rows = storage::list_node_templates(&state.pool, &tenant, query.all_versions == Some(true))
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!({
+        "templates": rows.iter().map(node_template_json).collect::<Vec<_>>(),
+    })))
+}
+
+async fn get_node_template(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(slug): Path<String>,
+    Query(query): Query<NodeTemplateQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let t = storage::get_node_template(&state.pool, &tenant, &slug, query.version)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::NotFound("node template not found".into()))?;
+    Ok(Json(node_template_json(&t)))
+}
+
+async fn list_node_template_versions(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let rows = storage::list_node_templates(&state.pool, &tenant, true)
+        .await
+        .map_err(AppError::from)?;
+    let versions: Vec<_> = rows.iter().filter(|t| t.slug == slug).map(node_template_json).collect();
+    if versions.is_empty() {
+        return Err(AppError::NotFound("node template not found".into()));
+    }
+    Ok(Json(serde_json::json!({ "slug": slug, "versions": versions })))
+}
+
+/// POST /node-templates — body `{ "slug", "node_type", "config", "params"?, "name"?, "description"? }`.
+async fn create_node_template(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<NodeTemplateQuery>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let slug = body
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("slug is required".into()))?
+        .to_string();
+    publish(&state, &headers, &slug, &body, query.force == Some(true)).await
+}
+
+/// PUT /node-templates/:slug — publish the body as the next version (a no-op returning the
+/// latest version when nothing changed).
+async fn publish_node_template(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(slug): Path<String>,
+    Query(query): Query<NodeTemplateQuery>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    publish(&state, &headers, &slug, &body, query.force == Some(true)).await
+}
+
+async fn publish(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    slug: &str,
+    body: &serde_json::Value,
+    force: bool,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let tenant = require_tenant(headers)?;
+    let mut content = node_template_content(body)?;
+    templates::validate_content(slug, &mut content).map_err(AppError::BadRequest)?;
+    if !force {
+        let usages = storage::list_template_usages(&state.pool, &tenant, slug)
+            .await
+            .map_err(AppError::from)?;
+        let broken = templates::breaking_usages(slug, &content.params, &usages);
+        if !broken.is_empty() {
+            return Err(AppError::Conflict(format!(
+                "nodes following the latest version would break (pin them, set the param, or retry with ?force=true): {}",
+                broken.join("; ")
+            )));
+        }
+    }
+    let (t, created) = storage::publish_node_template(&state.pool, &tenant, slug, &content)
+        .await
+        .map_err(AppError::from)?;
+    let mut json = node_template_json(&t);
+    json["created"] = serde_json::Value::Bool(created);
+    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    Ok((status, Json(json)))
+}
+
+async fn list_node_template_usages(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let usages = storage::list_template_usages(&state.pool, &tenant, &slug)
+        .await
+        .map_err(AppError::from)?;
+    let floating = usages.iter().filter(|u| u.version.is_none()).count();
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "usages": usages,
+        "floating": floating,
+        "pinned": usages.len() - floating,
+    })))
+}
+
+/// DELETE /node-templates/:slug[?version=N]. Refused (409) while workflow nodes still use
+/// what would be removed: any node for the whole template; for one version, nodes pinned to
+/// it, or — when it is the latest — nodes following latest.
+async fn delete_node_template(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(slug): Path<String>,
+    Query(query): Query<NodeTemplateQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let target = storage::get_node_template(&state.pool, &tenant, &slug, query.version)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::NotFound("node template not found".into()))?;
+    let usages = storage::list_template_usages(&state.pool, &tenant, &slug)
+        .await
+        .map_err(AppError::from)?;
+    let blocking: Vec<String> = usages
+        .iter()
+        .filter(|u| match query.version {
+            None => true,
+            Some(v) => u.version == Some(v) || (u.version.is_none() && target.is_latest),
+        })
+        .map(|u| format!("{} v{} / {}", u.workflow_name, u.workflow_version, u.node_id))
+        .collect();
+    if !blocking.is_empty() {
+        return Err(AppError::Conflict(format!("node template is in use by: {}", blocking.join(", "))));
+    }
+    let deleted = storage::delete_node_template(&state.pool, &tenant, &slug, query.version)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "version": query.version,
+        "deleted": deleted,
+    })))
 }

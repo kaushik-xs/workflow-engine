@@ -7,5 +7,6 @@ pub mod nodes;
 pub mod persistence;
 pub mod registry;
 pub mod storage;
+pub mod templates;
 pub mod trace;
 pub mod triggers;

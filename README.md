@@ -46,6 +46,13 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 | GET | /globals/:key | Get one global by key (requires **X-Tenant-ID**). |
 | PUT | /globals/:key | Upsert a global by key (requires **X-Tenant-ID**; body is the raw value, or `{ "value": ... }`). |
 | DELETE | /globals/:key | Delete a global (requires **X-Tenant-ID**). Returns `{ "key", "deleted": true }`. |
+| GET | /node-templates | List the tenant's [node templates](#node-templates) (latest version of each; `?all_versions=true` for all). Requires **X-Tenant-ID**. |
+| POST | /node-templates | Create a node template, or publish the next version if `slug` exists (body `{ "slug", "node_type", "config", "params"?, "name"?, "description"? }`). |
+| GET | /node-templates/:slug | Get the latest version, or `?version=N`. |
+| PUT | /node-templates/:slug | Publish the body as the next version (no-op when unchanged). `?force=true` skips the breaking-change check. |
+| GET | /node-templates/:slug/versions | Every version, newest first. |
+| GET | /node-templates/:slug/usages | Workflow nodes using the template, with `floating`/`pinned` counts. |
+| DELETE | /node-templates/:slug | Delete the template (or `?version=N`). 409 while workflows still use it. |
 
 ## Versioning and latest
 
@@ -64,6 +71,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 - **If** – Two-way conditional branch. Evaluates one condition and activates the `true` or `false` output port (config: `condition` as `{ left, operator, right }` or any truthy value, or top-level `left`/`operator`/`right`; optional `trueHandle`/`falseHandle` port labels).
 - **Switch** – Multi-way conditional branch over a `value` (config: `cases` array of `{ handle, value }` / `{ handle, operator, value }` / `{ handle, condition }`; `mode` `"first"` (default) or `"all"`; `default` handle when nothing matches).
 - **Loop** – Container that runs the nodes inside it once per item (config: `items`, an expression returning a list). See [Loops](#loops).
+- **Template** – A reference to a shared [node template](#node-templates) (config: `template`, optional `version`, `params`).
 
 ### Branching
 
@@ -168,6 +176,62 @@ exception is `formdata`: the engine generates the boundary, so it sets
 In the step output, `request.body` lists the parts sent. File parts show their `filename`,
 `contentType` and `size` in place of the content.
 
+## Node templates
+
+A node template is a reusable node kept once per tenant and referenced by any number of
+workflows, so it has a single source of truth: publish a change and every workflow using it
+runs the new version.
+
+```json
+PUT /node-templates/create-ticket
+{
+  "name": "Create ticket",
+  "node_type": "serviceCall",
+  "config": {
+    "method": "POST", "serviceSlug": "core", "path": "/api/v1/tickets",
+    "rawBody": { "id": "{{ params.ticketId }}", "priority": "{{ params.priority }}", "source": "{{ global.SOURCE }}" }
+  },
+  "params": { "ticketId": { "required": true, "label": "Ticket id" }, "priority": { "default": "low" } }
+}
+```
+
+- `node_type` is one of `HttpRequest`, `ServiceCall`, `WorkflowCall`, `SetVariable`, `If`,
+  `Switch`. `config` is what the node's `data` would be.
+- `params` declares what a workflow can set: `{ "<name>": { "required"?, "default"?, "label"?, "description"? } }`.
+  The config reads them as `{{ params.<name> }}`; using an undeclared one is rejected.
+- Versions are immutable. Each publish with changed content adds the next version and marks
+  it latest; publishing identical content does nothing (`created: false`).
+
+Use one in a workflow with a `template` node:
+
+```json
+{ "id": "mkTicket", "type": "template",
+  "data": { "template": "create-ticket", "version": 2, "params": { "ticketId": "{{ Webhook.body.id }}" } } }
+```
+
+- Without `version` the node follows the latest version; with it, it is pinned.
+- Param values may be `{{ }}` expressions; they are evaluated against the workflow's context
+  (`Webhook`, `nodes`, `local`, `item`, …) before the template's config reads them. Missing
+  params take their `default`.
+- Outputs, edges and branching work as for the underlying node: `{{ nodes.mkTicket.body }}`,
+  `If`/`Switch` handles, and `parentId` inside a Loop are unchanged.
+
+References are expanded when an execution starts, and the versions used are recorded in its
+context under `templates` (`{ "mkTicket": { "template": "create-ticket", "version": 2 } }`).
+A step-mode run keeps those versions even if a newer one is published while it is paused.
+
+Safety checks:
+
+- Saving a workflow (`POST`/`PUT /workflows`) fails with 400 if a template or pinned version
+  does not exist, a required param is missing, or an undeclared param is set.
+- Publishing a version that adds a required param fails with 409 while nodes following the
+  latest version do not set it (pin them, set it, or use `?force=true`).
+- Deleting a template, or a version still in use, fails with 409.
+  `GET /node-templates/:slug/usages` lists who uses it.
+
+Runs of workflows without template nodes are unaffected; runs with them do one extra
+query to load all their templates.
+
 ## Saving executions (persistence)
 
 Each workflow chooses how much of a run is saved to `workflow_executions` / `workflow_steps`, with `persistence` in its definition (`data.persistence`, or top-level `persistence`):
@@ -208,6 +272,7 @@ The execution context exposes these roots:
 - `global` – the tenant's stored globals (see the `/globals` API), snapshotted at execution start. Reference as `{{ global.API_BASE }}`.
 - `local` – workflow-scoped variables. Reference as `{{ local.counter }}`.
 - `item` / `index` – inside a [Loop](#loops) body: the current element and its position.
+- `params` – inside a [node template](#node-templates)'s config: the params the workflow node set.
 
 > The OS environment is **not** exposed to workflows. Anything that was previously read from `env` should be stored as a `global` (managed per tenant) or a `local` variable.
 
