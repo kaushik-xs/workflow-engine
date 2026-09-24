@@ -307,8 +307,112 @@ fn runtime() -> &'static Runtime {
             )),
         );
 
+        // now() -> string
+        // Current UTC time as an RFC 3339 string with millisecond precision,
+        // e.g. `"2026-09-24T10:15:00.123Z"`. Evaluated fresh on every call.
+        rt.register_function(
+            "now",
+            Box::new(CustomFunction::new(
+                Signature::new(vec![], None),
+                Box::new(|_args: &[Rcvar], _ctx| {
+                    use chrono::SubsecRound;
+                    let now = chrono::Utc::now().trunc_subsecs(3);
+                    Ok(Rcvar::new(jmespath::Variable::String(format_timestamp(now))))
+                }),
+            )),
+        );
+
+        // date_add(timestamp, amount, unit) -> string
+        // Shift a timestamp by `amount` units and return it as an RFC 3339 UTC string.
+        // Units: seconds, minutes, hours, days, weeks (singular or plural). A negative amount
+        // subtracts; fractional amounts are allowed (`1.5` hours). The timestamp may be any
+        // RFC 3339 string (offsets are normalised to UTC) or a bare `YYYY-MM-DD` date (midnight UTC).
+        //   date_add(now(), `2`, 'hours')
+        //   date_add(Webhook.body.created_at, `-30`, 'minutes')
+        rt.register_function(
+            "date_add",
+            Box::new(CustomFunction::new(
+                Signature::new(
+                    vec![ArgumentType::String, ArgumentType::Number, ArgumentType::String],
+                    None,
+                ),
+                Box::new(|args: &[Rcvar], _ctx| {
+                    // Signature validation guarantees (string, number, string).
+                    let ts = parse_timestamp(args[0].as_string().expect("validated as string"))
+                        .map_err(|e| fn_error(format!("date_add: {e}")))?;
+                    let amount = args[1].as_number().expect("validated as number");
+                    let unit = args[2].as_string().expect("validated as string");
+
+                    let unit_ms: f64 = match unit.as_str() {
+                        "second" | "seconds" => 1_000.0,
+                        "minute" | "minutes" => 60_000.0,
+                        "hour" | "hours" => 3_600_000.0,
+                        "day" | "days" => 86_400_000.0,
+                        "week" | "weeks" => 604_800_000.0,
+                        other => {
+                            return Err(fn_error(format!(
+                                "date_add: unknown unit '{other}' (expected seconds, minutes, hours, days or weeks)"
+                            )))
+                        }
+                    };
+                    let delta = chrono::Duration::try_milliseconds((amount * unit_ms).round() as i64)
+                        .ok_or_else(|| fn_error("date_add: amount out of range".to_string()))?;
+                    let shifted = ts
+                        .checked_add_signed(delta)
+                        .ok_or_else(|| fn_error("date_add: result out of range".to_string()))?;
+                    Ok(Rcvar::new(jmespath::Variable::String(format_timestamp(shifted))))
+                }),
+            )),
+        );
+
+        // format_date(timestamp, format) -> string
+        // Render a timestamp (same inputs as `date_add`) in UTC using a strftime-style format,
+        // e.g. `format_date(now(), '%Y-%m-%d')` -> `"2026-09-24"`.
+        rt.register_function(
+            "format_date",
+            Box::new(CustomFunction::new(
+                Signature::new(vec![ArgumentType::String, ArgumentType::String], None),
+                Box::new(|args: &[Rcvar], _ctx| {
+                    use std::fmt::Write;
+                    let ts = parse_timestamp(args[0].as_string().expect("validated as string"))
+                        .map_err(|e| fn_error(format!("format_date: {e}")))?;
+                    let fmt = args[1].as_string().expect("validated as string");
+                    // `write!` surfaces invalid format specifiers as an error; `to_string` would panic.
+                    let mut out = String::new();
+                    write!(out, "{}", ts.format(fmt))
+                        .map_err(|_| fn_error(format!("format_date: invalid format '{fmt}'")))?;
+                    Ok(Rcvar::new(jmespath::Variable::String(out)))
+                }),
+            )),
+        );
+
         rt
     })
+}
+
+fn fn_error(msg: String) -> jmespath::JmespathError {
+    jmespath::JmespathError::new("", 0, ErrorReason::Parse(msg))
+}
+
+/// Parse an RFC 3339 timestamp (normalised to UTC) or a bare `YYYY-MM-DD` date (midnight UTC).
+fn parse_timestamp(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(date
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc());
+    }
+    Err(format!(
+        "invalid timestamp '{s}' (expected RFC 3339, e.g. 2026-09-24T10:15:00Z, or YYYY-MM-DD)"
+    ))
+}
+
+/// RFC 3339 in UTC with a `Z` suffix; fractional seconds only when present.
+fn format_timestamp(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 /// Compile JMESPath expression, using cache on hit. Expressions are JMESPath-only (safe, no arbitrary code).
@@ -821,6 +925,80 @@ mod tests {
             evaluate("to_object(pairs, 'keep_nulls')", &ctx).unwrap(),
             serde_json::json!({ "a": 1, "b": null })
         );
+    }
+
+    #[test]
+    fn now_returns_current_utc_rfc3339() {
+        let before = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let v = evaluate("now()", &serde_json::json!({})).unwrap();
+        let s = v.as_str().expect("now() returns a string");
+        assert!(s.ends_with('Z'));
+        let parsed = chrono::DateTime::parse_from_rfc3339(s).unwrap();
+        assert!(parsed >= before && parsed <= chrono::Utc::now());
+    }
+
+    #[test]
+    fn date_add_shifts_by_each_unit() {
+        let ctx = serde_json::json!({ "ts": "2026-09-24T10:15:00Z" });
+        let cases = [
+            ("date_add(ts, `30`, 'seconds')", "2026-09-24T10:15:30Z"),
+            ("date_add(ts, `45`, 'minutes')", "2026-09-24T11:00:00Z"),
+            ("date_add(ts, `2`, 'hours')", "2026-09-24T12:15:00Z"),
+            ("date_add(ts, `1.5`, 'hours')", "2026-09-24T11:45:00Z"),
+            ("date_add(ts, `7`, 'days')", "2026-10-01T10:15:00Z"),
+            ("date_add(ts, `1`, 'week')", "2026-10-01T10:15:00Z"),
+            ("date_add(ts, `-1`, 'day')", "2026-09-23T10:15:00Z"),
+        ];
+        for (expr, expected) in cases {
+            assert_eq!(
+                evaluate(expr, &ctx).unwrap(),
+                serde_json::json!(expected),
+                "{expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_add_normalises_offsets_and_accepts_bare_dates() {
+        let ctx = serde_json::json!({
+            "ist": "2026-09-24T15:45:00+05:30",
+            "day": "2026-09-24"
+        });
+        assert_eq!(
+            evaluate("date_add(ist, `0`, 'hours')", &ctx).unwrap(),
+            serde_json::json!("2026-09-24T10:15:00Z")
+        );
+        assert_eq!(
+            evaluate("date_add(day, `1`, 'days')", &ctx).unwrap(),
+            serde_json::json!("2026-09-25T00:00:00Z")
+        );
+        // Composes with now().
+        assert!(evaluate("date_add(now(), `3`, 'days')", &ctx).is_ok());
+    }
+
+    #[test]
+    fn date_add_rejects_bad_timestamp_and_unit() {
+        let ctx = serde_json::json!({ "ts": "2026-09-24T10:15:00Z" });
+        assert!(evaluate("date_add('yesterday', `1`, 'days')", &ctx).is_err());
+        assert!(evaluate("date_add(ts, `1`, 'months')", &ctx).is_err());
+    }
+
+    #[test]
+    fn format_date_renders_strftime_patterns() {
+        let ctx = serde_json::json!({ "ts": "2026-09-24T10:15:00Z" });
+        assert_eq!(
+            evaluate("format_date(ts, '%Y-%m-%d')", &ctx).unwrap(),
+            serde_json::json!("2026-09-24")
+        );
+        assert_eq!(
+            evaluate(
+                "format_date(date_add(ts, `1`, 'days'), '%d/%m/%Y %H:%M')",
+                &ctx
+            )
+            .unwrap(),
+            serde_json::json!("25/09/2026 10:15")
+        );
+        assert!(evaluate("format_date(ts, '%Q')", &ctx).is_err());
     }
 
     #[test]
