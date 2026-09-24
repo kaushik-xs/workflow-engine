@@ -58,7 +58,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 
 - **HttpTrigger** – Entry point; Webhook context is set by the HTTP layer.
 - **HttpRequest** – Calls an external HTTP API (config: `method`, `url` or `path`, optional `body`/`headers`/`bodyMode`; see [HTTP request bodies](#http-request-bodies)).
-- **ServiceCall** – Calls an internal service (config: `serviceSlug`, `operation`). Uses the registered service registry (stub `authrs` by default).
+- **ServiceCall** – Calls an internal service (config: `serviceSlug`, `operation`; optional `rawBody`/`body`/`headers`/`bodyMode`, see [HTTP request bodies](#http-request-bodies)). Uses the registered service registry (stub `authrs` by default).
 - **WorkflowCall** – Runs another workflow as a nested execution and returns its response (config: `workflowId` or `workflow`/`workflowName` with optional `version`/`tenant`; payload via `rawBody`/`body`). Guarded against self-calls and cycles (max depth 10).
 - **SetVariable** – Writes into the workflow's `local` scope during execution (config: `variables` object, or a single `key`/`value`; values support `{{ }}`). Updated `{{ local.* }}` values are visible to downstream nodes and later steps.
 - **If** – Two-way conditional branch. Evaluates one condition and activates the `true` or `false` output port (config: `condition` as `{ left, operator, right }` or any truthy value, or top-level `left`/`operator`/`right`; optional `trueHandle`/`falseHandle` port labels).
@@ -79,11 +79,12 @@ not supported — workflows are DAGs.
 
 ### HTTP request bodies
 
-`HttpRequest` encodes `body` according to the optional `bodyMode`:
+`HttpRequest` and `ServiceCall` encode the request body according to the optional `bodyMode`.
+The body field is `body`/`payload` for `HttpRequest` and `rawBody` (or `body`) for `ServiceCall`:
 
 | `bodyMode` | `body` | Sent as |
 |---|---|---|
-| *(omitted)* | object / array / string | JSON for objects and arrays; strings as-is. Default `Content-Type: application/json` (unchanged behaviour). |
+| *(omitted)* | object / array / string | JSON for objects and arrays; strings as-is (unchanged behaviour). `HttpRequest` defaults string bodies to `Content-Type: application/json`. |
 | `none` | ignored | No body. |
 | `raw` | string | The string as-is. Default `Content-Type: text/plain`. |
 | `formdata` | array of rows | `multipart/form-data` (aliases: `form-data`, `multipart`). |

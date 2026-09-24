@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing;
 
+use super::http_body::{build_form_parts, form_summary, to_reqwest_form, BodyMode, FormPart};
 use crate::expression;
 use crate::storage;
 
@@ -26,13 +27,28 @@ fn raw_body_string(config: &Value, input: &Value) -> Option<String> {
 }
 
 /// Build request log (method, url, headers, body) for steps/executions and tracing.
-fn request_log(method: &str, url: &str, config: &Value, input: &Value) -> Value {
-    let body = config
-        .get("body")
-        .cloned()
-        .or_else(|| input.get("body").cloned());
-    let raw_body = raw_body_string(config, input);
-    let body_for_log: Value = raw_body.map(Value::String).or(body).unwrap_or(Value::Null);
+fn request_log(
+    method: &str,
+    url: &str,
+    config: &Value,
+    input: &Value,
+    body_mode: BodyMode,
+    form_parts: Option<&[FormPart]>,
+) -> Value {
+    let body_for_log = if let Some(parts) = form_parts {
+        form_summary(parts)
+    } else if body_mode == BodyMode::None {
+        Value::Null
+    } else {
+        let body = config
+            .get("body")
+            .cloned()
+            .or_else(|| input.get("body").cloned());
+        raw_body_string(config, input)
+            .map(Value::String)
+            .or(body)
+            .unwrap_or(Value::Null)
+    };
 
     let mut headers = input
         .get("headers")
@@ -49,6 +65,7 @@ fn request_log(method: &str, url: &str, config: &Value, input: &Value) -> Value 
         "method": method,
         "url": url,
         "headers": Value::Object(headers),
+        "bodyMode": body_mode.as_str(),
         "body": body_for_log
     })
 }
@@ -112,6 +129,31 @@ impl NodeExecutor for ServiceCallExecutor {
             }
         }
 
+        let body_mode = BodyMode::parse(
+            config
+                .get("bodyMode")
+                .or_else(|| input.get("bodyMode"))
+                .unwrap_or(&Value::Null),
+        )?;
+        // Form-data rows live in `rawBody` (what the builder edits), falling back to `body`.
+        let form_parts = match body_mode {
+            BodyMode::FormData => Some(build_form_parts(
+                config
+                    .get("rawBody")
+                    .or_else(|| input.get("rawBody"))
+                    .or_else(|| config.get("body"))
+                    .or_else(|| input.get("body"))
+                    .unwrap_or(&Value::Null),
+            )?),
+            _ => None,
+        };
+        if body_mode == BodyMode::Raw && raw_body_string(&config, &input).is_none() {
+            let has_other_body = config.get("body").or_else(|| input.get("body")).is_some_and(|b| !b.is_null());
+            if has_other_body {
+                return Err("ServiceCall bodyMode \"raw\" requires rawBody to be a string".to_string());
+            }
+        }
+
         // Continue this execution's trace on the outbound call (fresh span-id per hop).
         let traceparent = ctx
             .trace_id
@@ -119,49 +161,80 @@ impl NodeExecutor for ServiceCallExecutor {
             .filter(|s| !s.is_empty())
             .map(crate::trace::format_traceparent);
 
-        let apply_headers_and_body =
-            |req: reqwest::RequestBuilder, config: &Value, input: &Value| {
-                let body = config
-                    .get("body")
-                    .cloned()
-                    .or_else(|| input.get("body").cloned());
-                let raw_body = raw_body_string(config, input);
+        let apply_headers_and_body = |req: reqwest::RequestBuilder,
+                                      config: &Value,
+                                      input: &Value,
+                                      form: Option<reqwest::multipart::Form>| {
+            let body = config
+                .get("body")
+                .cloned()
+                .or_else(|| input.get("body").cloned());
+            let raw_body = raw_body_string(config, input);
 
-                let mut headers = input
-                    .get("headers")
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default();
-                if let Some(config_headers) = config.get("headers").and_then(Value::as_object) {
-                    for (k, v) in config_headers {
-                        headers.insert(k.clone(), v.clone());
-                    }
+            let mut headers = input
+                .get("headers")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(config_headers) = config.get("headers").and_then(Value::as_object) {
+                for (k, v) in config_headers {
+                    headers.insert(k.clone(), v.clone());
                 }
+            }
+            let user_content_type = headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"));
 
-                let mut req = req;
-                if let Some(ref raw) = raw_body {
-                    req = req.body(raw.clone());
-                } else if let Some(ref b) = body {
-                    if *b != Value::Null {
-                        req = req.json(b);
+            // User headers go on before the body: reqwest appends headers, so a default set
+            // first would be sent alongside the user's. Form-data owns Content-Type because it
+            // must carry the generated boundary.
+            let mut req = req;
+            for (k, v) in &headers {
+                if body_mode == BodyMode::FormData && k.eq_ignore_ascii_case("content-type") {
+                    continue;
+                }
+                if let Some(s) = v.as_str() {
+                    req = req.header(k.as_str(), s);
+                }
+            }
+            match body_mode {
+                BodyMode::None => {}
+                BodyMode::FormData => {
+                    if let Some(form) = form {
+                        req = req.multipart(form);
                     }
                 }
-                for (k, v) in &headers {
-                    if let Some(s) = v.as_str() {
-                        req = req.header(k.as_str(), s);
+                BodyMode::Raw => {
+                    if let Some(raw) = raw_body {
+                        if !user_content_type {
+                            req = req.header("Content-Type", "text/plain");
+                        }
+                        req = req.body(raw);
                     }
                 }
-                // Add traceparent unless the workflow author set one explicitly.
-                if let Some(ref tp) = traceparent {
-                    let user_set = headers
-                        .keys()
-                        .any(|k| k.eq_ignore_ascii_case(crate::trace::TRACEPARENT_HEADER));
-                    if !user_set {
-                        req = req.header(crate::trace::TRACEPARENT_HEADER, tp);
+                BodyMode::Legacy => {
+                    if let Some(raw) = raw_body {
+                        req = req.body(raw);
+                    } else if let Some(ref b) = body {
+                        if *b != Value::Null {
+                            req = req.json(b);
+                        }
                     }
                 }
-                req
-            };
+            }
+            // Add traceparent unless the workflow author set one explicitly.
+            if let Some(ref tp) = traceparent {
+                let user_set = headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(crate::trace::TRACEPARENT_HEADER));
+                if !user_set {
+                    req = req.header(crate::trace::TRACEPARENT_HEADER, tp);
+                }
+            }
+            req
+        };
+        let request_log_for = |method: &str, url: &str| {
+            request_log(method, url, &config, &input, body_mode, form_parts.as_deref())
+        };
+        let form = form_parts.clone().map(to_reqwest_form).transpose()?;
 
         if let Some(url_val) = config.get("url").and_then(|v| v.as_str()) {
             let method = config
@@ -171,7 +244,7 @@ impl NodeExecutor for ServiceCallExecutor {
                 .unwrap_or("GET")
                 .to_uppercase();
 
-            let request = request_log(&method, url_val, &config, &input);
+            let request = request_log_for(&method, url_val);
             tracing::info!(
                 execution_id = %ctx.execution_id,
                 node_type = "serviceCall",
@@ -189,7 +262,7 @@ impl NodeExecutor for ServiceCallExecutor {
                 "DELETE" => self.client.delete(url_val),
                 _ => self.client.get(url_val),
             };
-            req = apply_headers_and_body(req, &config, &input);
+            req = apply_headers_and_body(req, &config, &input, form);
 
             let resp = req.send().await.map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
@@ -253,7 +326,7 @@ impl NodeExecutor for ServiceCallExecutor {
             .unwrap_or("GET")
             .to_uppercase();
 
-        let request = request_log(&method, &url, &config, &input);
+        let request = request_log_for(&method, &url);
         tracing::info!(
             execution_id = %ctx.execution_id,
             node_type = "serviceCall",
@@ -271,7 +344,7 @@ impl NodeExecutor for ServiceCallExecutor {
             "DELETE" => self.client.delete(&url),
             _ => self.client.get(&url),
         };
-        req = apply_headers_and_body(req, &config, &input);
+        req = apply_headers_and_body(req, &config, &input, form);
 
         let resp = req.send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
@@ -298,7 +371,90 @@ impl NodeExecutor for ServiceCallExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nodes::http_body::test_support::{capture_one, header_values};
     use serde_json::json;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn formdata_rows_in_raw_body_send_multipart() {
+        let (url, server) = capture_one().await;
+        let context = json!({
+            "local": { "parentTicketId": "T-1" },
+            "Webhook": { "body": { "ticketAttachments": [
+                { "attachmentName": "a.pdf", "fileType": "application/pdf", "contentBase64": "JVBERi0xLjQ=" }
+            ] } }
+        });
+        let mut config = json!({
+            "method": "POST",
+            "url": url,
+            "headers": { "Content-Type": "multipart/form-data; boundary=RegereFormBoundary", "X-Tenant-ID": "t1" },
+            "bodyMode": "formdata",
+            "rawBody": [
+                { "key": "ticketId", "type": "text", "value": "{{ local.parentTicketId }}" },
+                { "key": "attachmentName", "type": "text", "value": "{{ Webhook.body.ticketAttachments[*].attachmentName }}" },
+                { "key": "attachmentPath", "type": "file", "value": "{{ Webhook.body.ticketAttachments[*].{filename: attachmentName, contentType: fileType, base64: contentBase64} }}" }
+            ]
+        });
+        // The executor interpolates config before the node runs; mirror that here.
+        expression::interpolate_value(&mut config, &context).unwrap();
+        let ctx = ExecutionContext::new(Uuid::nil(), Uuid::nil(), context);
+        let out = ServiceCallExecutor::default().execute(&ctx, "n1", Value::Null, config).await.unwrap();
+        let (head, body) = server.await.unwrap();
+
+        let content_types = header_values(&head, "content-type");
+        assert_eq!(content_types.len(), 1, "{head}");
+        let boundary = content_types[0].strip_prefix("multipart/form-data; boundary=").expect(content_types[0]);
+        assert_ne!(boundary, "RegereFormBoundary");
+        assert_eq!(header_values(&head, "x-tenant-id"), ["t1"]);
+        let body = String::from_utf8(body).unwrap();
+        assert_eq!(
+            body,
+            format!(
+                "--{b}\r\nContent-Disposition: form-data; name=\"ticketId\"\r\n\r\nT-1\r\n\
+                 --{b}\r\nContent-Disposition: form-data; name=\"attachmentName\"\r\n\r\na.pdf\r\n\
+                 --{b}\r\nContent-Disposition: form-data; name=\"attachmentPath\"; filename=\"a.pdf\"\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4\r\n\
+                 --{b}--\r\n",
+                b = boundary
+            )
+        );
+        assert_eq!(out["request"]["bodyMode"], "formdata");
+        assert_eq!(out["request"]["body"][2]["size"], 8);
+    }
+
+    #[tokio::test]
+    async fn legacy_json_body_keeps_single_user_content_type() {
+        let (url, server) = capture_one().await;
+        let config = json!({
+            "method": "POST",
+            "url": url,
+            "headers": { "Content-Type": "application/vnd.api+json" },
+            "body": { "a": 1 }
+        });
+        let ctx = ExecutionContext::new(Uuid::nil(), Uuid::nil(), json!({}));
+        ServiceCallExecutor::default().execute(&ctx, "n1", Value::Null, config).await.unwrap();
+        let (head, body) = server.await.unwrap();
+        assert_eq!(header_values(&head, "content-type"), ["application/vnd.api+json"]);
+        assert_eq!(body, b"{\"a\":1}");
+    }
+
+    #[tokio::test]
+    async fn raw_mode_defaults_to_text_plain_and_none_mode_drops_body() {
+        let ctx = ExecutionContext::new(Uuid::nil(), Uuid::nil(), json!({}));
+        let (url, server) = capture_one().await;
+        let config = json!({ "method": "POST", "url": url, "bodyMode": "raw", "rawBody": "hello" });
+        ServiceCallExecutor::default().execute(&ctx, "n1", Value::Null, config).await.unwrap();
+        let (head, body) = server.await.unwrap();
+        assert_eq!(header_values(&head, "content-type"), ["text/plain"]);
+        assert_eq!(body, b"hello");
+
+        let (url, server) = capture_one().await;
+        let config = json!({ "method": "POST", "url": url, "bodyMode": "none", "rawBody": "{\"a\":1}" });
+        let out = ServiceCallExecutor::default().execute(&ctx, "n1", Value::Null, config).await.unwrap();
+        let (head, body) = server.await.unwrap();
+        assert!(header_values(&head, "content-type").is_empty(), "{head}");
+        assert!(body.is_empty());
+        assert_eq!(out["request"]["body"], Value::Null);
+    }
 
     #[test]
     fn raw_body_string_passes_through_a_plain_string() {

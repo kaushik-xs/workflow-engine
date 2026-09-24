@@ -12,6 +12,7 @@ pub use switch::SwitchExecutor;
 pub use workflow_call::WorkflowCallExecutor;
 
 mod condition;
+mod http_body;
 mod http_request;
 mod http_trigger;
 mod if_node;
