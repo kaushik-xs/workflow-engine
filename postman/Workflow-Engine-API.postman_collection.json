@@ -1,14 +1,15 @@
 {
   "info": {
     "name": "Workflow Engine API",
-    "description": "REST API for the workflow execution engine. Optional header: X-Tenant-ID to scope workflows by tenant. Request body can include `tenant` on create/update; it is stored in the workflow table. Variables: `base_url`, `workflow_id`, `execution_id`, `tenant`.",
+    "description": "REST API for the workflow execution engine. Optional header: X-Tenant-ID to scope workflows by tenant. Request body can include `tenant` on create/update; it is stored in the workflow table. Variables: `base_url`, `workflow_id`, `execution_id`, `tenant`, `template_slug`.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     { "key": "base_url", "value": "http://localhost:3000", "type": "string" },
     { "key": "workflow_id", "value": "", "type": "string" },
     { "key": "execution_id", "value": "", "type": "string" },
-    { "key": "tenant", "value": "", "type": "string", "description": "Required for create (non-empty). Optional for list/get/trigger to scope by tenant." }
+    { "key": "tenant", "value": "", "type": "string", "description": "Required for create (non-empty). Optional for list/get/trigger to scope by tenant." },
+    { "key": "template_slug", "value": "create-ticket", "type": "string", "description": "Node template slug. Set by Create/Publish Node Template." }
   ],
   "item": [
     {
@@ -232,6 +233,159 @@
             ],
             "url": "{{base_url}}/executions/{{execution_id}}/step",
             "description": "Run the next step for a paused execution (step-by-step mode). Execution must be in paused state. Returns execution with updated status and steps. Use execution_id from Trigger Webhook (step mode)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Node Templates",
+      "description": "Reusable, versioned node definitions. Use one in a workflow with a node `{ \"type\": \"template\", \"data\": { \"template\": \"<slug>\", \"version\"?: n, \"params\": {...} } }`.",
+      "item": [
+        {
+          "name": "Create Node Template",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Tenant-ID",
+                "value": "{{tenant}}",
+                "description": "Required. Templates are per tenant."
+              }
+            ],
+            "url": "{{base_url}}/node-templates",
+            "description": "Create a template (version 1), or publish the next version if `slug` exists. Body: `slug`, `node_type` (HttpRequest, ServiceCall, WorkflowCall, SetVariable, If, Switch), `config` (the node's data; reads params as `{{ params.x }}`), `params` (`{ name: { required?, default?, label?, description? } }`), optional `name`/`description`. Identical content returns the latest version with `created: false` (200). 409 when nodes following the latest version would lack a new required param; add `?force=true` to publish anyway. Saves `slug` to `template_slug`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"slug\": \"create-ticket\",\n  \"name\": \"Create ticket\",\n  \"description\": \"Creates a ticket in the core service\",\n  \"node_type\": \"serviceCall\",\n  \"config\": {\n    \"method\": \"POST\",\n    \"serviceSlug\": \"core\",\n    \"path\": \"/api/v1/tickets\",\n    \"rawBody\": {\n      \"id\": \"{{ params.ticketId }}\",\n      \"priority\": \"{{ params.priority }}\"\n    }\n  },\n  \"params\": {\n    \"ticketId\": {\n      \"required\": true,\n      \"label\": \"Ticket id\"\n    },\n    \"priority\": {\n      \"default\": \"low\"\n    }\n  }\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200 || pm.response.code === 201) {",
+                  "    pm.collectionVariables.set('template_slug', pm.response.json().slug);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "List Node Templates",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Tenant-ID",
+                "value": "{{tenant}}",
+                "description": "Required. Templates are per tenant."
+              }
+            ],
+            "url": "{{base_url}}/node-templates",
+            "description": "Latest version of each template. `?all_versions=true` lists every version."
+          }
+        },
+        {
+          "name": "Get Node Template",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Tenant-ID",
+                "value": "{{tenant}}",
+                "description": "Required. Templates are per tenant."
+              }
+            ],
+            "url": "{{base_url}}/node-templates/{{template_slug}}",
+            "description": "Latest version, or `?version=N`."
+          }
+        },
+        {
+          "name": "Publish Node Template Version",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Tenant-ID",
+                "value": "{{tenant}}",
+                "description": "Required. Templates are per tenant."
+              }
+            ],
+            "url": "{{base_url}}/node-templates/{{template_slug}}",
+            "description": "Publish the body as the next version (same body as create, without `slug`). Versions are immutable; workflows referencing the template without `version` pick it up on their next run. `?force=true` skips the breaking-change check.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Create ticket\",\n  \"description\": \"Creates a ticket in the core service\",\n  \"node_type\": \"serviceCall\",\n  \"config\": {\n    \"method\": \"POST\",\n    \"serviceSlug\": \"core\",\n    \"path\": \"/api/v1/tickets\",\n    \"rawBody\": {\n      \"id\": \"{{ params.ticketId }}\",\n      \"priority\": \"{{ params.priority }}\"\n    }\n  },\n  \"params\": {\n    \"ticketId\": {\n      \"required\": true,\n      \"label\": \"Ticket id\"\n    },\n    \"priority\": {\n      \"default\": \"low\"\n    }\n  }\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200 || pm.response.code === 201) {",
+                  "    pm.collectionVariables.set('template_slug', pm.response.json().slug);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "List Node Template Versions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Tenant-ID",
+                "value": "{{tenant}}",
+                "description": "Required. Templates are per tenant."
+              }
+            ],
+            "url": "{{base_url}}/node-templates/{{template_slug}}/versions",
+            "description": "Every version, newest first."
+          }
+        },
+        {
+          "name": "List Node Template Usages",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Tenant-ID",
+                "value": "{{tenant}}",
+                "description": "Required. Templates are per tenant."
+              }
+            ],
+            "url": "{{base_url}}/node-templates/{{template_slug}}/usages",
+            "description": "Workflow nodes using the template: `usages` (`workflow_id`, `workflow_name`, `workflow_version`, `node_id`, `version` — null = follows latest) with `floating`/`pinned` counts."
+          }
+        },
+        {
+          "name": "Delete Node Template",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-Tenant-ID",
+                "value": "{{tenant}}",
+                "description": "Required. Templates are per tenant."
+              }
+            ],
+            "url": "{{base_url}}/node-templates/{{template_slug}}",
+            "description": "Delete the template, or one version with `?version=N`. 409 while workflow nodes still use it (for one version: nodes pinned to it, or following latest when it is the latest)."
           }
         }
       ]

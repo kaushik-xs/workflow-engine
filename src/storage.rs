@@ -594,3 +594,253 @@ pub async fn get_service_by_slug(
     .await?;
     Ok(row)
 }
+
+/// One immutable version of a reusable node template (see `crate::templates`).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct NodeTemplate {
+    pub id: Uuid,
+    pub tenant: String,
+    pub slug: String,
+    pub version: i32,
+    pub is_latest: bool,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub node_type: String,
+    pub config: serde_json::Value,
+    pub params: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The editable content of a node template; publishing it creates a new version.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeTemplateContent {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub node_type: String,
+    pub config: serde_json::Value,
+    pub params: serde_json::Value,
+}
+
+const NODE_TEMPLATE_COLUMNS: &str =
+    "id, tenant, slug, version, is_latest, name, description, node_type, config, params, created_at";
+
+/// The latest version of each of a tenant's templates, or every version when `all_versions`.
+pub async fn list_node_templates(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    all_versions: bool,
+) -> Result<Vec<NodeTemplate>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {NODE_TEMPLATE_COLUMNS} FROM node_templates
+         WHERE tenant = $1 AND ($2 OR is_latest)
+         ORDER BY slug, version DESC"
+    );
+    sqlx::query_as::<_, NodeTemplate>(&sql)
+        .bind(tenant)
+        .bind(all_versions)
+        .fetch_all(pool)
+        .await
+}
+
+/// One template version: `version`, or the latest when `None`.
+pub async fn get_node_template(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    slug: &str,
+    version: Option<i32>,
+) -> Result<Option<NodeTemplate>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {NODE_TEMPLATE_COLUMNS} FROM node_templates
+         WHERE tenant = $1 AND slug = $2 AND (($3::int IS NULL AND is_latest) OR version = $3)"
+    );
+    sqlx::query_as::<_, NodeTemplate>(&sql)
+        .bind(tenant)
+        .bind(slug)
+        .bind(version)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Candidate rows for resolving a set of references in one query: the latest version of
+/// each slug plus any of the listed pinned versions. The caller picks the exact match.
+pub async fn fetch_node_templates(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    slugs: &[String],
+    versions: &[i32],
+) -> Result<Vec<NodeTemplate>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {NODE_TEMPLATE_COLUMNS} FROM node_templates
+         WHERE tenant = $1 AND slug = ANY($2) AND (is_latest OR version = ANY($3))"
+    );
+    sqlx::query_as::<_, NodeTemplate>(&sql)
+        .bind(tenant)
+        .bind(slugs)
+        .bind(versions)
+        .fetch_all(pool)
+        .await
+}
+
+/// Publish `content` as the next version of `slug` and mark it latest. When it is identical
+/// to the current latest version nothing is written, so re-syncing unchanged content does
+/// not mint versions. Returns the latest version and whether it was created.
+pub async fn publish_node_template(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    slug: &str,
+    content: &NodeTemplateContent,
+) -> Result<(NodeTemplate, bool), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // Serialize publishes of the same template so version numbers cannot collide.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || '/' || $2))")
+        .bind(tenant)
+        .bind(slug)
+        .execute(&mut *tx)
+        .await?;
+    let sql = format!(
+        "SELECT {NODE_TEMPLATE_COLUMNS} FROM node_templates
+         WHERE tenant = $1 AND slug = $2 ORDER BY version DESC LIMIT 1"
+    );
+    let newest = sqlx::query_as::<_, NodeTemplate>(&sql)
+        .bind(tenant)
+        .bind(slug)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let Some(t) = newest.as_ref().filter(|t| t.is_latest) {
+        let current = NodeTemplateContent {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            node_type: t.node_type.clone(),
+            config: t.config.clone(),
+            params: t.params.clone(),
+        };
+        if current == *content {
+            tx.commit().await?;
+            return Ok((t.clone(), false));
+        }
+    }
+    let version = newest.map_or(1, |t| t.version + 1);
+    sqlx::query("UPDATE node_templates SET is_latest = false WHERE tenant = $1 AND slug = $2")
+        .bind(tenant)
+        .bind(slug)
+        .execute(&mut *tx)
+        .await?;
+    let sql = format!(
+        "INSERT INTO node_templates (tenant, slug, version, is_latest, name, description, node_type, config, params)
+         VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8)
+         RETURNING {NODE_TEMPLATE_COLUMNS}"
+    );
+    let row = sqlx::query_as::<_, NodeTemplate>(&sql)
+        .bind(tenant)
+        .bind(slug)
+        .bind(version)
+        .bind(&content.name)
+        .bind(&content.description)
+        .bind(&content.node_type)
+        .bind(&content.config)
+        .bind(&content.params)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok((row, true))
+}
+
+/// Delete one version of a template, or all of them when `version` is `None`. If the latest
+/// version goes, the highest remaining one becomes latest. Returns the number of rows removed.
+pub async fn delete_node_template(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    slug: &str,
+    version: Option<i32>,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let deleted = sqlx::query(
+        "DELETE FROM node_templates WHERE tenant = $1 AND slug = $2 AND ($3::int IS NULL OR version = $3)",
+    )
+    .bind(tenant)
+    .bind(slug)
+    .bind(version)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "UPDATE node_templates SET is_latest = true
+         WHERE id = (SELECT id FROM node_templates WHERE tenant = $1 AND slug = $2 ORDER BY version DESC LIMIT 1)
+           AND NOT EXISTS (SELECT 1 FROM node_templates WHERE tenant = $1 AND slug = $2 AND is_latest)",
+    )
+    .bind(tenant)
+    .bind(slug)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(deleted)
+}
+
+/// A workflow node that references a template (`version` `None` = follows latest).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TemplateUsage {
+    pub node_id: String,
+    pub slug: String,
+    pub version: Option<i32>,
+}
+
+/// Replace the recorded template usages of a workflow with `usages`.
+pub async fn replace_template_usages(
+    pool: &sqlx::PgPool,
+    workflow_id: Uuid,
+    tenant: &str,
+    usages: &[TemplateUsage],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM workflow_template_usages WHERE workflow_id = $1")
+        .bind(workflow_id)
+        .execute(&mut *tx)
+        .await?;
+    for u in usages {
+        sqlx::query(
+            "INSERT INTO workflow_template_usages (workflow_id, node_id, tenant, slug, version)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(workflow_id)
+        .bind(&u.node_id)
+        .bind(tenant)
+        .bind(&u.slug)
+        .bind(u.version)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// A workflow node using a template, with the workflow it belongs to.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct TemplateUsageRow {
+    pub workflow_id: Uuid,
+    pub workflow_name: String,
+    pub workflow_version: i32,
+    pub workflow_is_latest: bool,
+    pub node_id: String,
+    pub version: Option<i32>,
+    #[serde(skip)]
+    pub definition: serde_json::Value,
+}
+
+/// Every workflow node that references `slug`.
+pub async fn list_template_usages(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    slug: &str,
+) -> Result<Vec<TemplateUsageRow>, sqlx::Error> {
+    sqlx::query_as::<_, TemplateUsageRow>(
+        "SELECT u.workflow_id, w.name AS workflow_name, w.version AS workflow_version,
+                w.is_latest AS workflow_is_latest, u.node_id, u.version, w.definition
+         FROM workflow_template_usages u JOIN workflows w ON w.id = u.workflow_id
+         WHERE u.tenant = $1 AND u.slug = $2
+         ORDER BY w.name, w.version, u.node_id",
+    )
+    .bind(tenant)
+    .bind(slug)
+    .fetch_all(pool)
+    .await
+}

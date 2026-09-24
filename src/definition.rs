@@ -9,6 +9,9 @@ pub struct NodeSpec {
     pub input: Value,
     /// Enclosing Loop node id (React Flow `parentId`), `None` for top-level nodes.
     pub parent: Option<String>,
+    /// Params of a node expanded from a template (see `crate::templates`), exposed to its
+    /// config as `{{ params.* }}`. `None` for ordinary nodes.
+    pub params: Option<Value>,
 }
 
 /// Edge for execution order.
@@ -110,12 +113,14 @@ fn node_to_spec(node: &Value) -> Result<NodeSpec, String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let params = node.get("templateParams").filter(|p| p.is_object()).cloned();
     Ok(NodeSpec {
         id,
         node_type,
         config,
         input,
         parent,
+        params,
     })
 }
 

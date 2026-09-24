@@ -20,6 +20,7 @@ use crate::expression;
 use crate::persistence::{Persistence, Recorder};
 use crate::registry::NodeRegistry;
 use crate::storage;
+use crate::templates;
 
 /// Maximum nesting depth for WorkflowCall nodes, to guard against infinite recursion
 /// through indirect cycles (A calls B calls A ...).
@@ -165,6 +166,18 @@ impl NodeExecutor for WorkflowCallExecutor {
         )
         .await?;
 
+        // Expand the child's template references and record the versions it runs with.
+        let resolved = templates::resolve_definition(
+            self.pool.as_ref(),
+            &workflow.tenant,
+            &workflow.definition,
+            None,
+        )
+        .await
+        .map_err(|e| format!("WorkflowCall: {e}"))?;
+        let mut initial_context = initial_context;
+        templates::record_lock(&mut initial_context, resolved.lock);
+
         let registry = self
             .registry
             .upgrade()
@@ -197,7 +210,7 @@ impl NodeExecutor for WorkflowCallExecutor {
         let run = executor::run_workflow(
             &recorder,
             registry,
-            &workflow.definition,
+            &resolved.definition,
             initial_context,
             // Sub-workflow runs in-process under the same trace as its parent.
             ctx.trace_id.clone(),
