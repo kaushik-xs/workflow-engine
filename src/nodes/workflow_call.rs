@@ -217,6 +217,16 @@ impl NodeExecutor for WorkflowCallExecutor {
         )
         .await?;
 
+        // The sub-workflow suspended (a Wait inside it). WorkflowCall does not wait for it,
+        // so cancel it rather than leave it to resume later with no one reading its result.
+        if run.waiting {
+            let _ = storage::cancel_execution(self.pool.as_ref(), sub_execution_id).await;
+            return Err(format!(
+                "WorkflowCall: workflow {} suspended (execution {}, now cancelled); waiting inside a called workflow is not supported",
+                workflow.name, sub_execution_id
+            ));
+        }
+
         // The workflow "response" is its last top-level node's output — the same value
         // the webhook trigger returns for a workflow.
         let response = run.result.unwrap_or(Value::Null);

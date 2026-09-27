@@ -9,6 +9,10 @@
 //!   - `none`: nothing is written.
 //!
 //! Step mode always uses `full`, since each step reloads its state from the database.
+//!
+//! A run that suspends (see the Wait node) is always saved, whatever its mode: it has to be
+//! resumed from the database. Its execution row and the steps so far are written when it
+//! suspends, and the rest of the run is recorded in `full` mode.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -16,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use uuid::Uuid;
 
-use crate::storage::{self, StepRecord, WorkflowExecution};
+use crate::storage::{self, StepRecord, WorkflowExecution, WorkflowWait};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Persistence {
@@ -61,8 +65,10 @@ pub struct Recorder {
     workflow_id: Uuid,
     workflow_version: Option<i32>,
     started_at: DateTime<Utc>,
-    /// Steps held back in `errors_only` mode until the run fails.
+    /// Steps held back in `errors_only` and `none` mode, until the run fails or suspends.
     buffer: Mutex<Vec<StepRecord>>,
+    /// The wait a node asked for, saved when the run suspends.
+    pending_wait: Mutex<Option<WorkflowWait>>,
     /// Set once the run is finalized, so a failure is recorded only once.
     finished: AtomicBool,
 }
@@ -91,6 +97,7 @@ impl Recorder {
             workflow_version,
             started_at,
             buffer: Mutex::new(Vec::new()),
+            pending_wait: Mutex::new(None),
             finished: AtomicBool::new(false),
         })
     }
@@ -105,6 +112,7 @@ impl Recorder {
             workflow_version: None,
             started_at: Utc::now(),
             buffer: Mutex::new(Vec::new()),
+            pending_wait: Mutex::new(None),
             finished: AtomicBool::new(false),
         }
     }
@@ -136,7 +144,7 @@ impl Recorder {
                     .await
                     .map_err(|e| e.to_string())?;
             }
-            Persistence::ErrorsOnly => self.lock_buffer().push(StepRecord {
+            Persistence::ErrorsOnly | Persistence::None => self.lock_buffer().push(StepRecord {
                 node_id: node_id.to_string(),
                 iteration: iteration.to_string(),
                 status: status.to_string(),
@@ -144,7 +152,6 @@ impl Recorder {
                 error: error.map(str::to_string),
                 created_at: Utc::now(),
             }),
-            Persistence::None => {}
         }
         Ok(())
     }
@@ -174,11 +181,10 @@ impl Recorder {
             )
             .await
             .map_err(|e| e.to_string()),
-            Persistence::ErrorsOnly => {
+            Persistence::ErrorsOnly | Persistence::None => {
                 self.lock_buffer().clear();
                 Ok(())
             }
-            Persistence::None => Ok(()),
         }
     }
 
@@ -214,8 +220,49 @@ impl Recorder {
                     .await
                     .map_err(|e| e.to_string())
             }
-            Persistence::None => Ok(()),
+            Persistence::None => {
+                self.lock_buffer().clear();
+                Ok(())
+            }
         }
+    }
+
+    /// Hold the wait a node asked for until the run [suspends](Self::suspend).
+    pub fn wait(&self, wait: WorkflowWait) {
+        *self.pending_wait.lock().unwrap_or_else(|e| e.into_inner()) = Some(wait);
+    }
+
+    /// Save the run as `waiting` on the pending wait, with `context` as the state to resume
+    /// from. In `errors_only` and `none` mode this is when the execution and its held-back
+    /// steps are first written.
+    pub async fn suspend(&self, context: &Value) -> Result<(), String> {
+        if self.finished.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let wait = self
+            .pending_wait
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or("suspended without a wait")?;
+        let result = match self.mode {
+            Persistence::Full => storage::suspend_execution(&self.pool, self.execution_id, context, &wait, None).await,
+            Persistence::ErrorsOnly | Persistence::None => {
+                let steps = std::mem::take(&mut *self.lock_buffer());
+                let execution = WorkflowExecution {
+                    id: self.execution_id,
+                    workflow_id: self.workflow_id,
+                    workflow_version: self.workflow_version,
+                    status: "waiting".to_string(),
+                    context: context.clone(),
+                    started_at: self.started_at,
+                    finished_at: None,
+                };
+                storage::suspend_execution(&self.pool, self.execution_id, context, &wait, Some((&execution, &steps)))
+                    .await
+            }
+        };
+        result.map_err(|e| e.to_string())
     }
 
     fn lock_buffer(&self) -> std::sync::MutexGuard<'_, Vec<StepRecord>> {

@@ -1,12 +1,12 @@
 use crate::definition::{self, EdgeSpec, NodeSpec};
 use crate::expression;
-use crate::nodes::NodeExecutor;
+use crate::nodes::{NodeExecutor, NodeOutcome, ResumeReason, SuspendSpec};
 use crate::persistence::Recorder;
 use crate::registry::NodeRegistry;
-use crate::storage;
+use crate::storage::{self, WorkflowWait};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 /// Execution context passed to each node: full context (nodes, Webhook, env, current).
@@ -161,6 +161,40 @@ pub struct RunNextStepResult {
 /// Node type of the loop container. Nodes whose `parent` is a Loop form its body.
 const LOOP_NODE_TYPE: &str = "Loop";
 
+/// Why a run stopped before finishing.
+#[derive(Debug)]
+enum RunError {
+    /// A node failed; the message says why.
+    Failed(String),
+    /// A node suspended the run. It has been saved as `waiting`.
+    Suspended,
+}
+
+impl From<String> for RunError {
+    fn from(e: String) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl RunError {
+    /// Prefix a failure's message (a suspension passes through unchanged).
+    fn context(self, prefix: impl std::fmt::Display) -> Self {
+        match self {
+            Self::Failed(e) => Self::Failed(format!("{prefix}: {e}")),
+            Self::Suspended => Self::Suspended,
+        }
+    }
+}
+
+/// The suspended node a resumed run continues, and what woke it.
+#[derive(Debug, Clone)]
+pub struct ResumeTarget {
+    pub node_id: String,
+    pub iteration: String,
+    pub state: Value,
+    pub reason: ResumeReason,
+}
+
 /// What every node run needs besides the evolving context.
 struct RunEnv<'a> {
     recorder: &'a Recorder,
@@ -170,6 +204,45 @@ struct RunEnv<'a> {
     trace_id: Option<&'a str>,
     nodes: &'a [NodeSpec],
     edges: &'a [EdgeSpec],
+    /// Whether the run goes one top-level node per request (resumes the same way).
+    step_mode: bool,
+    /// Outputs of steps that completed before the run was suspended, by (node id,
+    /// iteration). A resumed run replays the graph from the top, and these nodes are not
+    /// run again: their recorded outputs are reused. Empty for a fresh run.
+    replay: HashMap<(String, String), Value>,
+    /// The suspended node to resume instead of running, taken when it is reached.
+    resume: Mutex<Option<ResumeTarget>>,
+}
+
+impl RunEnv<'_> {
+    /// The recorded output of a node that already completed, when it can be reused as is.
+    /// Top-level nodes' effects are already in the saved context, and a leaf's effects are
+    /// reapplied from its output, but a Loop nested in another Loop reruns (from its body's
+    /// recorded steps) so the `local` changes made inside it are rebuilt too.
+    fn replayed(&self, node: &NodeSpec, tag: &str) -> Option<Value> {
+        if node.node_type == LOOP_NODE_TYPE && !tag.is_empty() {
+            return None;
+        }
+        self.replay.get(&(node.id.clone(), tag.to_string())).cloned()
+    }
+
+    /// The resume target when it is this node.
+    fn take_resume(&self, node: &NodeSpec, tag: &str) -> Option<ResumeTarget> {
+        let mut resume = self.resume.lock().unwrap_or_else(|e| e.into_inner());
+        match &*resume {
+            Some(t) if t.node_id == node.id && t.iteration == tag => resume.take(),
+            _ => None,
+        }
+    }
+}
+
+/// Outputs of the completed steps of an execution, keyed for [`RunEnv::replay`].
+fn replay_map(steps: &[storage::WorkflowStep]) -> HashMap<(String, String), Value> {
+    steps
+        .iter()
+        .filter(|s| s.status == "completed")
+        .map(|s| ((s.node_id.clone(), s.iteration.clone()), s.output.clone().unwrap_or(Value::Null)))
+        .collect()
 }
 
 /// Step tag for a run inside loops: the loop indices from the outermost loop inwards,
@@ -246,6 +319,9 @@ fn validate_loops(nodes: &[NodeSpec], edges: &[EdgeSpec]) -> Result<(), String> 
 /// Inside a loop only the step is recorded; the context is saved once the whole Loop
 /// node finishes, so a long loop does not rewrite the full context per item. What is
 /// actually written depends on the run's persistence mode (see [`Recorder`]).
+///
+/// When the node (or one inside a Loop) suspends, the run is saved as `waiting` with the
+/// context as it stood before this top-level node, which is where a resume replays from.
 /// Returns the updated context and the node's output.
 async fn run_single_node(
     env: &RunEnv<'_>,
@@ -253,12 +329,19 @@ async fn run_single_node(
     last_output: Value,
     node: &NodeSpec,
     iteration: &[usize],
-) -> Result<(Value, Value), String> {
+) -> Result<(Value, Value), RunError> {
     let mut exec_ctx = ExecutionContext::new(env.workflow_id, env.execution_id, context);
     exec_ctx.trace_id = env.trace_id.map(str::to_string);
     exec_ctx.set_current(last_output);
     let tag = iteration_tag(iteration);
     let top_level = iteration.is_empty();
+
+    // Completed before the run was suspended: reuse its output instead of running it again.
+    if let Some(output) = env.replayed(node, &tag) {
+        tracing::debug!(execution_id = %env.execution_id, node_id = %node.id, iteration = %tag, "replaying node");
+        apply_output(&mut exec_ctx, node, &output);
+        return Ok((exec_ctx.context, output));
+    }
 
     tracing::info!(
         execution_id = %env.execution_id,
@@ -269,16 +352,23 @@ async fn run_single_node(
     );
 
     let result = if node.node_type == LOOP_NODE_TYPE {
-        run_loop(env, &mut exec_ctx, node, iteration).await
+        run_loop(env, &mut exec_ctx, node, iteration).await.map(NodeOutcome::Complete)
     } else {
         match env.registry.get(&node.node_type) {
-            Some(executor) => execute_node(executor.as_ref(), &exec_ctx, node).await,
-            None => Err(format!("unknown node type: {}", node.node_type)),
+            Some(executor) => match env.take_resume(node, &tag) {
+                Some(target) => {
+                    tracing::info!(execution_id = %env.execution_id, node_id = %node.id, iteration = %tag, "resuming node");
+                    executor.resume(&exec_ctx, &node.id, target.state, target.reason).await
+                }
+                None => execute_node(executor.as_ref(), &exec_ctx, node).await,
+            }
+            .map_err(RunError::Failed),
+            None => Err(RunError::Failed(format!("unknown node type: {}", node.node_type))),
         }
     };
 
     match result {
-        Ok(output) => {
+        Ok(NodeOutcome::Complete(output)) => {
             tracing::debug!(
                 execution_id = %env.execution_id,
                 node_id = %node.id,
@@ -286,14 +376,7 @@ async fn run_single_node(
                 output = ?output,
                 "node executed successfully"
             );
-            // A SetVariable node returns an object of variables to write into the `local`
-            // scope; merge them so subsequent nodes (and later steps) see the updates.
-            if node.node_type == "SetVariable" {
-                if let Value::Object(vars) = &output {
-                    merge_into_local(&mut exec_ctx.context, vars);
-                }
-            }
-            exec_ctx.set_node_output(&node.id, output.clone());
+            apply_output(&mut exec_ctx, node, &output);
             let context = exec_ctx.context;
             if top_level {
                 env.recorder.progress(&context).await?;
@@ -301,7 +384,38 @@ async fn run_single_node(
             env.recorder.step(&node.id, &tag, "completed", Some(&output), None).await?;
             Ok((context, output))
         }
-        Err(e) => {
+        Ok(NodeOutcome::Suspend(spec)) => {
+            if spec.wake_at.is_none() && spec.correlation_key.is_none() {
+                let e = format!("{} suspended without a time or a signal to resume on", node.id);
+                let _ = env.recorder.step(&node.id, &tag, "failed", None, Some(&e)).await;
+                if top_level {
+                    env.recorder.fail(&exec_ctx.context).await?;
+                }
+                return Err(RunError::Failed(e));
+            }
+            tracing::info!(
+                execution_id = %env.execution_id,
+                node_id = %node.id,
+                iteration = %tag,
+                wake_at = ?spec.wake_at,
+                correlation_key = ?spec.correlation_key,
+                "node suspended the run"
+            );
+            env.recorder.step(&node.id, &tag, "waiting", Some(&spec.state), None).await?;
+            env.recorder.wait(wait_record(env, node, &tag, spec));
+            if top_level {
+                env.recorder.suspend(&exec_ctx.context).await?;
+            }
+            Err(RunError::Suspended)
+        }
+        Err(RunError::Suspended) => {
+            // A node inside this Loop suspended.
+            if top_level {
+                env.recorder.suspend(&exec_ctx.context).await?;
+            }
+            Err(RunError::Suspended)
+        }
+        Err(RunError::Failed(e)) => {
             tracing::error!(
                 execution_id = %env.execution_id,
                 node_id = %node.id,
@@ -316,8 +430,34 @@ async fn run_single_node(
                 env.recorder.fail(&exec_ctx.context).await?;
             }
             // Inside a loop, name the failing node so the Loop's error points at it.
-            Err(if top_level { e } else { format!("{}: {e}", node.id) })
+            Err(RunError::Failed(if top_level { e } else { format!("{}: {e}", node.id) }))
         }
+    }
+}
+
+/// Put a node's output into the context: `nodes.<id>`, and for SetVariable its variables
+/// into the `local` scope so subsequent nodes (and later steps) see the updates.
+fn apply_output(exec_ctx: &mut ExecutionContext, node: &NodeSpec, output: &Value) {
+    if node.node_type == "SetVariable" {
+        if let Value::Object(vars) = output {
+            merge_into_local(&mut exec_ctx.context, vars);
+        }
+    }
+    exec_ctx.set_node_output(&node.id, output.clone());
+}
+
+fn wait_record(env: &RunEnv<'_>, node: &NodeSpec, tag: &str, spec: SuspendSpec) -> WorkflowWait {
+    WorkflowWait {
+        execution_id: env.execution_id,
+        node_id: node.id.clone(),
+        iteration: tag.to_string(),
+        wake_at: spec.wake_at,
+        correlation_key: spec.correlation_key,
+        filter: spec.filter,
+        state: spec.state,
+        step_mode: env.step_mode,
+        trace_id: env.trace_id.map(str::to_string),
+        created_at: chrono::Utc::now(),
     }
 }
 
@@ -326,7 +466,7 @@ async fn execute_node(
     executor: &dyn NodeExecutor,
     exec_ctx: &ExecutionContext,
     node: &NodeSpec,
-) -> Result<Value, String> {
+) -> Result<NodeOutcome, String> {
     let mut input = node.input.clone();
     let mut config = node.config.clone();
     tracing::debug!(
@@ -359,7 +499,7 @@ async fn execute_node(
         config_after = ?config,
         "interpolated node input and config"
     );
-    executor.execute(exec_ctx, &node.id, input, config).await
+    executor.run(exec_ctx, &node.id, input, config).await
 }
 
 /// Resolve a Loop's `items` into the list to iterate. An expression that yields `null`
@@ -396,13 +536,16 @@ fn resolve_items(config: &Value, context: &Value) -> Result<Vec<Value>, String> 
 /// `nodes.<id>` holds only that iteration's outputs. Changes to `local` carry over to
 /// later iterations and past the loop, so SetVariable can accumulate.
 ///
+/// `exec_ctx.context` is only updated once every item has run, so when a body node suspends
+/// it still holds the context the Loop started from, and a resume resolves the same items.
+///
 /// Output: `{ "count", "results": [ { "<body node id>": <output>, ... } per item ] }`.
 async fn run_loop(
     env: &RunEnv<'_>,
     exec_ctx: &mut ExecutionContext,
     node: &NodeSpec,
     iteration: &[usize],
-) -> Result<Value, String> {
+) -> Result<Value, RunError> {
     let items = resolve_items(&node.config, &exec_ctx.context)?;
     let body_ids: Vec<&str> = env
         .nodes
@@ -411,9 +554,10 @@ async fn run_loop(
         .map(|n| n.id.as_str())
         .collect();
 
+    let mut loop_context = exec_ctx.context.clone();
     let mut results = Vec::with_capacity(items.len());
     for (index, item) in items.into_iter().enumerate() {
-        let mut context = exec_ctx.context.clone();
+        let mut context = loop_context.clone();
         if let Value::Object(map) = &mut context {
             map.insert("item".to_string(), item.clone());
             map.insert("index".to_string(), Value::from(index));
@@ -422,7 +566,7 @@ async fn run_loop(
         path.push(index);
         let (context, _) = run_scope(env, Some(node.id.as_str()), context, item, &path)
             .await
-            .map_err(|e| format!("item {index}: {e}"))?;
+            .map_err(|e| e.context(format_args!("item {index}")))?;
 
         let outputs = context.get("nodes").and_then(Value::as_object);
         let result: serde_json::Map<String, Value> = body_ids
@@ -431,14 +575,15 @@ async fn run_loop(
             .collect();
         results.push(Value::Object(result));
         if let Some(local) = context.get("local").and_then(Value::as_object) {
-            merge_into_local(&mut exec_ctx.context, local);
+            merge_into_local(&mut loop_context, local);
         }
     }
+    exec_ctx.context = loop_context;
     Ok(serde_json::json!({ "count": results.len(), "results": results }))
 }
 
 type ScopeFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Value, Value), String>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Value, Value), RunError>> + Send + 'a>>;
 
 /// Run the nodes of one scope (the top level, or a Loop body for one item) in topological
 /// order, skipping nodes on branches not taken. Returns the final context and last output.
@@ -548,18 +693,53 @@ fn merged_predecessor_outputs(context: &Value, preds: &[String]) -> Value {
     Value::Object(map)
 }
 
-/// A workflow run that completed.
+/// A workflow run that completed, or suspended to wait.
 #[derive(Debug)]
 pub struct WorkflowRun {
-    /// Final execution context.
+    /// Final execution context (the context saved to resume from, when waiting).
     pub context: Value,
     /// The workflow's response: the output of the last top-level node that ran, or `None`
-    /// when no node ran. This is what the webhook trigger returns.
+    /// when no node ran (or the run is waiting). This is what the webhook trigger returns.
     pub result: Option<Value>,
+    /// The run suspended and was saved as `waiting`; it resumes later (see `crate::waits`).
+    pub waiting: bool,
 }
 
-/// Run workflow to completion (or first failure), recording the execution and its steps
-/// through `recorder` according to its persistence mode.
+fn parse_definition(definition: &Value) -> Result<(Vec<NodeSpec>, Vec<EdgeSpec>), String> {
+    definition::parse_workflow(definition)
+        .and_then(|(nodes, edges)| validate_loops(&nodes, &edges).map(|_| (nodes, edges)))
+}
+
+/// Run the whole graph from the top and finish the execution through `env.recorder`.
+async fn run_to_end(env: &RunEnv<'_>, mut context: Value) -> Result<WorkflowRun, String> {
+    if !context.is_object() {
+        context = Value::Object(serde_json::Map::new());
+    }
+    ensure_context_shape(&mut context);
+
+    let (context, last_output) =
+        match run_scope(env, None, context, Value::Object(serde_json::Map::new()), &[]).await {
+            Ok(done) => done,
+            Err(RunError::Failed(e)) => return Err(e),
+            Err(RunError::Suspended) => {
+                return Ok(WorkflowRun { context: Value::Null, result: None, waiting: true })
+            }
+        };
+
+    env.recorder.complete(&context).await?;
+    let any_ran = context
+        .get("nodes")
+        .and_then(Value::as_object)
+        .is_some_and(|n| !n.is_empty());
+    Ok(WorkflowRun {
+        result: any_ran.then_some(last_output),
+        context,
+        waiting: false,
+    })
+}
+
+/// Run workflow to completion (or first failure, or until a node suspends it), recording
+/// the execution and its steps through `recorder` according to its persistence mode.
 pub async fn run_workflow(
     recorder: &Recorder,
     node_registry: Arc<dyn NodeRegistry>,
@@ -567,9 +747,7 @@ pub async fn run_workflow(
     initial_context: Value,
     trace_id: Option<String>,
 ) -> Result<WorkflowRun, String> {
-    let parsed = definition::parse_workflow(definition)
-        .and_then(|(nodes, edges)| validate_loops(&nodes, &edges).map(|_| (nodes, edges)));
-    let (node_specs, edge_specs) = match parsed {
+    let (node_specs, edge_specs) = match parse_definition(definition) {
         Ok(parsed) => parsed,
         Err(e) => {
             if let Err(e2) = recorder.fail(&initial_context).await {
@@ -586,26 +764,56 @@ pub async fn run_workflow(
         trace_id: trace_id.as_deref(),
         nodes: &node_specs,
         edges: &edge_specs,
+        step_mode: false,
+        replay: HashMap::new(),
+        resume: Mutex::new(None),
     };
+    run_to_end(&env, initial_context).await
+}
 
-    let mut context = initial_context;
-    if !context.is_object() {
-        context = Value::Object(serde_json::Map::new());
+/// Continue a suspended execution to its end: replay the graph from the saved `context`,
+/// reusing the outputs of steps that already completed, resume `target`, and run the rest.
+/// The execution must already be claimed (see `storage::claim_wait`); it is recorded in
+/// `full` mode from here on.
+pub async fn resume_workflow(
+    pool: &sqlx::PgPool,
+    node_registry: Arc<dyn NodeRegistry>,
+    execution: storage::WorkflowExecution,
+    definition: &Value,
+    target: ResumeTarget,
+    trace_id: Option<String>,
+) -> Result<WorkflowRun, String> {
+    let storage::WorkflowExecution { id: execution_id, workflow_id, context, .. } = execution;
+    let recorder = Recorder::existing(pool, execution_id, workflow_id);
+    let (node_specs, edge_specs) = match parse_definition(definition) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            recorder.fail(&context).await?;
+            return Err(e);
+        }
+    };
+    let steps = storage::list_steps_by_execution(pool, execution_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let env = RunEnv {
+        recorder: &recorder,
+        registry: node_registry.as_ref(),
+        workflow_id,
+        execution_id,
+        trace_id: trace_id.as_deref(),
+        nodes: &node_specs,
+        edges: &edge_specs,
+        step_mode: false,
+        replay: replay_map(&steps),
+        resume: Mutex::new(Some(target)),
+    };
+    let run = run_to_end(&env, context).await;
+    // The resumed node must have been reached; if the definition no longer has it, the
+    // run above completed without it, which would silently drop the wait's outcome.
+    if env.resume.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        tracing::warn!(execution_id = %execution_id, "resumed node was not reached; it is no longer in the workflow");
     }
-    ensure_context_shape(&mut context);
-
-    let (context, last_output) =
-        run_scope(&env, None, context, Value::Object(serde_json::Map::new()), &[]).await?;
-
-    recorder.complete(&context).await?;
-    let any_ran = context
-        .get("nodes")
-        .and_then(Value::as_object)
-        .is_some_and(|n| !n.is_empty());
-    Ok(WorkflowRun {
-        result: any_ran.then_some(last_output),
-        context,
-    })
+    run
 }
 
 /// Predecessors: for each node_id, the set of node ids that must complete before it (sources of edges targeting it).
@@ -674,21 +882,25 @@ fn node_reachable(
     }
 }
 
-/// Run the next runnable step for a paused execution. Execution must be in `paused` status.
+/// Run the next runnable step for a paused execution. Execution must be in `paused` status,
+/// or be a claimed step-mode execution resuming `resume` (the node it was waiting on).
 /// Loads steps from DB to determine which node to run next; updates execution and step; returns new status and context.
 pub async fn run_next_step(
     pool: &sqlx::PgPool,
     node_registry: Arc<dyn NodeRegistry>,
-    execution_id: Uuid,
-    workflow_id: Uuid,
+    execution: storage::WorkflowExecution,
     definition: &Value,
-    mut context: Value,
     trace_id: Option<String>,
+    resume: Option<ResumeTarget>,
 ) -> Result<RunNextStepResult, String> {
+    let storage::WorkflowExecution { id: execution_id, workflow_id, mut context, .. } = execution;
     let (node_specs, edge_specs) = definition::parse_workflow(definition)?;
     validate_loops(&node_specs, &edge_specs)?;
     // Step mode always saves everything: each step reloads its state from the database.
     let recorder = Recorder::existing(pool, execution_id, workflow_id);
+    let steps = storage::list_steps_by_execution(pool, execution_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let env = RunEnv {
         recorder: &recorder,
         registry: node_registry.as_ref(),
@@ -697,13 +909,14 @@ pub async fn run_next_step(
         trace_id: trace_id.as_deref(),
         nodes: &node_specs,
         edges: &edge_specs,
+        step_mode: true,
+        // Only a Loop resumed mid-way finds completed steps inside it to reuse.
+        replay: replay_map(&steps),
+        resume: Mutex::new(resume),
     };
     // A step is one top-level node; a Loop runs its whole body within its step.
     let ScopeGraph { order, nodes_by_id, pred, incoming } = ScopeGraph::new(&node_specs, &edge_specs, None);
 
-    let steps = storage::list_steps_by_execution(pool, execution_id)
-        .await
-        .map_err(|e| e.to_string())?;
     // A node is "resolved" once it has completed, failed, or been skipped.
     let mut resolved: HashSet<String> = steps
         .iter()
@@ -786,7 +999,13 @@ pub async fn run_next_step(
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
     };
 
-    let (new_context, _) = run_single_node(&env, context, last_output, node, &[]).await?;
+    let new_context = match run_single_node(&env, context, last_output, node, &[]).await {
+        Ok((new_context, _)) => new_context,
+        Err(RunError::Failed(e)) => return Err(e),
+        Err(RunError::Suspended) => {
+            return Ok(RunNextStepResult { status: "waiting".to_string(), context: Value::Null })
+        }
+    };
 
     let steps_after = storage::list_steps_by_execution(pool, execution_id)
         .await
@@ -964,7 +1183,9 @@ mod tests {
             Uuid::nil(),
             serde_json::json!({ "Webhook": { "body": { "id": 42 } } }),
         );
-        let out = execute_node(&EchoConfig, &ctx, &spec).await.unwrap();
+        let NodeOutcome::Complete(out) = execute_node(&EchoConfig, &ctx, &spec).await.unwrap() else {
+            panic!("expected complete");
+        };
         assert_eq!(out["rawBody"], serde_json::json!({ "id": 42, "priority": "high" }));
         assert_eq!(out["path"], "/tickets/42");
     }

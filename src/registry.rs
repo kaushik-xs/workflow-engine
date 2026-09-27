@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 
 use crate::nodes::{
     HttpRequestExecutor, HttpTriggerExecutor, IfExecutor, MergeExecutor, ServiceCallExecutor,
-    SetVariableExecutor, SwitchExecutor, WorkflowCallExecutor,
+    SetVariableExecutor, SwitchExecutor, WaitExecutor, WorkflowCallExecutor,
 };
 
 pub trait NodeRegistry: Send + Sync {
@@ -32,6 +32,7 @@ impl DefaultNodeRegistry {
         };
         map.insert("ServiceCall".to_string(), service_call);
         map.insert("SetVariable".to_string(), Arc::new(SetVariableExecutor));
+        map.insert("Wait".to_string(), Arc::new(WaitExecutor));
         Self { map }
     }
 
