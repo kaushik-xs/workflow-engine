@@ -18,11 +18,13 @@ use workflow_engine::registry::{DefaultNodeRegistry, NodeRegistry};
 use workflow_engine::storage;
 use workflow_engine::templates;
 use workflow_engine::triggers;
+use workflow_engine::waits::Waits;
 
 #[derive(Clone)]
 struct AppState {
     pool: sqlx::PgPool,
     node_registry: Arc<dyn NodeRegistry>,
+    waits: Arc<Waits>,
 }
 
 #[derive(Serialize)]
@@ -66,6 +68,33 @@ struct ExecutionResponse {
     started_at: String,
     finished_at: Option<String>,
     steps: Vec<StepItem>,
+    /// What a `waiting` execution is waiting for; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait: Option<WaitItem>,
+}
+
+#[derive(Serialize)]
+struct WaitItem {
+    node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration: Option<String>,
+    wake_at: Option<String>,
+    correlation_key: Option<String>,
+    since: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SignalRequest {
+    key: String,
+    #[serde(default)]
+    payload: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct SignalResponse {
+    key: String,
+    /// Executions this signal resumed (they continue in the background).
+    resumed: Vec<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -145,9 +174,18 @@ async fn main() -> Result<(), anyhow::Error> {
     let node_registry: Arc<dyn NodeRegistry> =
         DefaultNodeRegistry::new_arc(Arc::new(pool.clone()));
 
+    // Resume runs suspended by a Wait node: due timers are polled here, signals arrive on
+    // POST /signals.
+    let env_num = |key: &str, default: u64| {
+        std::env::var(key).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(default)
+    };
+    let waits = Waits::new(pool.clone(), node_registry.clone(), env_num("WAIT_RESUME_CONCURRENCY", 4) as usize);
+    waits.spawn_timer_worker(std::time::Duration::from_millis(env_num("WAIT_POLL_INTERVAL_MS", 1000).max(100)));
+
     let state = AppState {
         pool: pool.clone(),
         node_registry,
+        waits,
     };
 
     let app = Router::new()
@@ -160,6 +198,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .route("/executions/latest-input", get(latest_execution_input))
         .route("/executions/:id", get(get_execution))
         .route("/executions/:id/step", post(run_next_step_handler))
+        .route("/executions/:id/cancel", post(cancel_execution))
+        .route("/signals", post(send_signal))
         .route("/node-templates", get(list_node_templates).post(create_node_template))
         .route(
             "/node-templates/:slug",
@@ -534,6 +574,7 @@ async fn trigger_webhook(
     .await;
 
     let (status, result, error) = match run {
+        Ok(run) if run.waiting => ("waiting", None, None),
         Ok(run) => ("completed", run.result, None),
         Err(e) => ("failed", None, Some(e)),
     };
@@ -731,11 +772,21 @@ async fn get_execution(
     headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ExecutionResponse>, AppError> {
+    let exec = load_execution(&state, &headers, id).await?;
+    execution_response(&state.pool, exec).await.map(Json)
+}
+
+/// The execution, when it exists and belongs to the caller's tenant (if one is given).
+async fn load_execution(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    id: Uuid,
+) -> Result<storage::WorkflowExecution, AppError> {
     let exec = storage::get_execution(&state.pool, id)
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::NotFound("execution not found".into()))?;
-    if let Some(ref tenant) = tenant_from_headers(&headers) {
+    if let Some(ref tenant) = tenant_from_headers(headers) {
         let w = storage::get_workflow_by_id(&state.pool, exec.workflow_id)
             .await
             .map_err(AppError::from)?
@@ -744,12 +795,22 @@ async fn get_execution(
             return Err(AppError::NotFound("execution not found".into()));
         }
     }
+    Ok(exec)
+}
 
-    let steps = storage::list_steps_by_execution(&state.pool, id)
+async fn execution_response(
+    pool: &sqlx::PgPool,
+    exec: storage::WorkflowExecution,
+) -> Result<ExecutionResponse, AppError> {
+    let steps = storage::list_steps_by_execution(pool, exec.id)
         .await
         .map_err(AppError::from)?;
-
-    Ok(Json(ExecutionResponse {
+    let wait = if exec.status == "waiting" {
+        storage::get_wait(pool, exec.id).await.map_err(AppError::from)?
+    } else {
+        None
+    };
+    Ok(ExecutionResponse {
         id: exec.id,
         workflow_id: exec.workflow_id,
         workflow_version: exec.workflow_version,
@@ -766,7 +827,50 @@ async fn get_execution(
                 iteration: Some(s.iteration).filter(|i| !i.is_empty()),
             })
             .collect(),
-    }))
+        wait: wait.map(|w| WaitItem {
+            node_id: w.node_id,
+            iteration: Some(w.iteration).filter(|i| !i.is_empty()),
+            wake_at: w.wake_at.map(|t| t.to_rfc3339()),
+            correlation_key: w.correlation_key,
+            since: w.created_at.to_rfc3339(),
+        }),
+    })
+}
+
+/// Cancel a waiting or paused execution: it will not resume.
+async fn cancel_execution(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ExecutionResponse>, AppError> {
+    let exec = load_execution(&state, &headers, id).await?;
+    if !storage::cancel_execution(&state.pool, id).await.map_err(AppError::from)? {
+        return Err(AppError::Conflict(format!(
+            "execution is {}; only waiting or paused executions can be cancelled",
+            exec.status
+        )));
+    }
+    let exec = load_execution(&state, &headers, id).await?;
+    execution_response(&state.pool, exec).await.map(Json)
+}
+
+/// Deliver a signal to the tenant's runs waiting on its key (see the Wait node).
+async fn send_signal(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SignalRequest>,
+) -> Result<Json<SignalResponse>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let key = body.key.trim().to_string();
+    if key.is_empty() {
+        return Err(AppError::BadRequest("key is required".into()));
+    }
+    let resumed = state
+        .waits
+        .signal(&tenant, &key, body.payload)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(SignalResponse { key, resumed }))
 }
 
 async fn run_next_step_handler(
@@ -774,19 +878,7 @@ async fn run_next_step_handler(
     headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ExecutionResponse>, AppError> {
-    let exec = storage::get_execution(&state.pool, id)
-        .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::NotFound("execution not found".into()))?;
-    if let Some(ref tenant) = tenant_from_headers(&headers) {
-        let w = storage::get_workflow_by_id(&state.pool, exec.workflow_id)
-            .await
-            .map_err(AppError::from)?
-            .ok_or_else(|| AppError::NotFound("execution not found".into()))?;
-        if w.tenant != *tenant {
-            return Err(AppError::NotFound("execution not found".into()));
-        }
-    }
+    let exec = load_execution(&state, &headers, id).await?;
     if exec.status != "paused" {
         return Err(AppError::BadRequest(
             "Execution is not in paused state.".into(),
@@ -812,41 +904,16 @@ async fn run_next_step_handler(
     let _ = executor::run_next_step(
         &state.pool,
         state.node_registry.clone(),
-        id,
-        exec.workflow_id,
+        exec,
         &resolved.definition,
-        exec.context,
         Some(trace_id.clone()),
+        None,
     )
     .instrument(span)
     .await;
 
-    let exec = storage::get_execution(&state.pool, id)
-        .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| AppError::NotFound("execution not found".into()))?;
-    let steps = storage::list_steps_by_execution(&state.pool, id)
-        .await
-        .map_err(AppError::from)?;
-
-    Ok(Json(ExecutionResponse {
-        id: exec.id,
-        workflow_id: exec.workflow_id,
-        workflow_version: exec.workflow_version,
-        status: exec.status,
-        context: exec.context,
-        started_at: exec.started_at.to_rfc3339(),
-        finished_at: exec.finished_at.map(|t| t.to_rfc3339()),
-        steps: steps
-            .into_iter()
-            .map(|s| StepItem {
-                node_id: s.node_id,
-                status: s.status,
-                output: s.output,
-                iteration: Some(s.iteration).filter(|i| !i.is_empty()),
-            })
-            .collect(),
-    }))
+    let exec = load_execution(&state, &headers, id).await?;
+    execution_response(&state.pool, exec).await.map(Json)
 }
 
 #[derive(serde::Deserialize, Default)]

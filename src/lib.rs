@@ -10,3 +10,4 @@ pub mod storage;
 pub mod templates;
 pub mod trace;
 pub mod triggers;
+pub mod waits;

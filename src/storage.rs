@@ -302,6 +302,15 @@ pub async fn insert_finished_execution(
     steps: &[StepRecord],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    insert_execution_with_steps(&mut tx, execution, steps).await?;
+    tx.commit().await
+}
+
+async fn insert_execution_with_steps(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    execution: &WorkflowExecution,
+    steps: &[StepRecord],
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO workflow_executions (id, workflow_id, workflow_version, status, context, started_at, finished_at)
@@ -315,7 +324,7 @@ pub async fn insert_finished_execution(
     .bind(&execution.context)
     .bind(execution.started_at)
     .bind(execution.finished_at)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     for s in steps {
         sqlx::query(
@@ -333,10 +342,166 @@ pub async fn insert_finished_execution(
         .bind(&s.output)
         .bind(&s.error)
         .bind(s.created_at)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
+    Ok(())
+}
+
+/// What a waiting execution is waiting for (see the `workflow_waits` migration).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct WorkflowWait {
+    pub execution_id: Uuid,
+    pub node_id: String,
+    pub iteration: String,
+    pub wake_at: Option<DateTime<Utc>>,
+    pub correlation_key: Option<String>,
+    pub filter: Option<String>,
+    pub state: serde_json::Value,
+    pub step_mode: bool,
+    pub trace_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+const WAIT_COLUMNS: &str =
+    "execution_id, node_id, iteration, wake_at, correlation_key, filter, state, step_mode, trace_id, created_at";
+
+/// Save a run as `waiting` on `wait`, in one transaction. `unsaved` is the execution row and
+/// steps of a run that was so far kept in memory (see `persistence::Recorder`); `None` when
+/// the row already exists, in which case only its status and context are updated.
+pub async fn suspend_execution(
+    pool: &sqlx::PgPool,
+    execution_id: Uuid,
+    context: &serde_json::Value,
+    wait: &WorkflowWait,
+    unsaved: Option<(&WorkflowExecution, &[StepRecord])>,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    match unsaved {
+        Some((execution, steps)) => insert_execution_with_steps(&mut tx, execution, steps).await?,
+        None => {
+            sqlx::query("UPDATE workflow_executions SET status = 'waiting', context = $2 WHERE id = $1")
+                .bind(execution_id)
+                .bind(context)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO workflow_waits
+            (execution_id, node_id, iteration, wake_at, correlation_key, filter, state, step_mode, trace_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(execution_id)
+    .bind(&wait.node_id)
+    .bind(&wait.iteration)
+    .bind(wait.wake_at)
+    .bind(&wait.correlation_key)
+    .bind(&wait.filter)
+    .bind(&wait.state)
+    .bind(wait.step_mode)
+    .bind(&wait.trace_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await
+}
+
+pub async fn get_wait(pool: &sqlx::PgPool, execution_id: Uuid) -> Result<Option<WorkflowWait>, sqlx::Error> {
+    sqlx::query_as::<_, WorkflowWait>(&format!(
+        "SELECT {WAIT_COLUMNS} FROM workflow_waits WHERE execution_id = $1"
+    ))
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Executions whose timer is due, earliest first.
+pub async fn due_waits(pool: &sqlx::PgPool, limit: i64) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT execution_id FROM workflow_waits WHERE wake_at <= now() ORDER BY wake_at LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Waits on a signal key, limited to one tenant's workflows.
+pub async fn waits_for_key(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    correlation_key: &str,
+) -> Result<Vec<WorkflowWait>, sqlx::Error> {
+    let columns = WAIT_COLUMNS
+        .split(", ")
+        .map(|c| format!("w.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query_as::<_, WorkflowWait>(&format!(
+        r#"
+        SELECT {columns}
+        FROM workflow_waits w
+        JOIN workflow_executions e ON e.id = w.execution_id
+        JOIN workflows f ON f.id = e.workflow_id
+        WHERE w.correlation_key = $1 AND f.tenant = $2
+        ORDER BY w.created_at
+        "#
+    ))
+    .bind(correlation_key)
+    .bind(tenant)
+    .fetch_all(pool)
+    .await
+}
+
+/// Take a waiting execution to resume it: delete its wait and mark it `running`, atomically.
+/// Returns `None` when someone else got there first (a timer and a signal racing, another
+/// replica, or a cancel), so each wait resumes at most once.
+pub async fn claim_wait(pool: &sqlx::PgPool, execution_id: Uuid) -> Result<Option<WorkflowWait>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let wait = sqlx::query_as::<_, WorkflowWait>(&format!(
+        "DELETE FROM workflow_waits WHERE execution_id = $1 RETURNING {WAIT_COLUMNS}"
+    ))
+    .bind(execution_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(wait) = wait else {
+        return Ok(None);
+    };
+    let updated = sqlx::query(
+        "UPDATE workflow_executions SET status = 'running' WHERE id = $1 AND status = 'waiting'",
+    )
+    .bind(execution_id)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(None);
+    }
+    tx.commit().await?;
+    Ok(Some(wait))
+}
+
+/// Cancel a waiting or paused execution. Returns false when it is in any other state.
+pub async fn cancel_execution(pool: &sqlx::PgPool, execution_id: Uuid) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        r#"
+        UPDATE workflow_executions SET status = 'cancelled', finished_at = now()
+        WHERE id = $1 AND status IN ('waiting', 'paused')
+        "#,
+    )
+    .bind(execution_id)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM workflow_waits WHERE execution_id = $1")
+        .bind(execution_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn update_execution(

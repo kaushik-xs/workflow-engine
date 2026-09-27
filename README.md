@@ -41,6 +41,8 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 | POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name; optional `?step=true` for step-by-step (debug) mode; optional `?persist=full|errors_only|none` overrides the workflow's persistence for this call. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
 | GET | /executions/:id | Get execution (includes `workflow_version` that was run) |
 | POST | /executions/:id/step | Run the next step for a paused execution (step-by-step mode). Returns the execution with updated status and steps. |
+| POST | /executions/:id/cancel | Cancel a `waiting` or `paused` execution so it never resumes (status `cancelled`). 409 in any other state. |
+| POST | /signals | Deliver a signal to the tenant's runs [waiting](#waiting-durable-timers-and-signals) on its key (requires **X-Tenant-ID**; body `{ "key", "payload"? }`). Returns `{ "key", "resumed": [execution ids] }`; resumed runs continue in the background. |
 | GET | /globals | List the tenant's globals (requires **X-Tenant-ID**). Returns `{ "globals": [{ "key", "value", "created_at", "updated_at" }] }`. |
 | PUT | /globals | Upsert a global (requires **X-Tenant-ID**; body `{ "key", "value" }`; `value` is any JSON). |
 | GET | /globals/:key | Get one global by key (requires **X-Tenant-ID**). |
@@ -71,6 +73,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 - **If** – Two-way conditional branch. Evaluates one condition and activates the `true` or `false` output port (config: `condition` as `{ left, operator, right }` or any truthy value, or top-level `left`/`operator`/`right`; optional `trueHandle`/`falseHandle` port labels).
 - **Switch** – Multi-way conditional branch over a `value` (config: `cases` array of `{ handle, value }` / `{ handle, operator, value }` / `{ handle, condition }`; `mode` `"first"` (default) or `"all"`; `default` handle when nothing matches).
 - **Loop** – Container that runs the nodes inside it once per item (config: `items`, an expression returning a list). See [Loops](#loops).
+- **Wait** – Suspends the run for a time, until a time, or until a signal arrives (with an optional timeout). See [Waiting](#waiting-durable-timers-and-signals).
 - **Template** – A reference to a shared [node template](#node-templates) (config: `template`, optional `version`, `params`).
 
 ### Branching
@@ -175,6 +178,55 @@ exception is `formdata`: the engine generates the boundary, so it sets
 
 In the step output, `request.body` lists the parts sent. File parts show their `filename`,
 `contentType` and `size` in place of the content.
+
+## Waiting (durable timers and signals)
+
+A **Wait** node pauses a run without holding anything open: the run is saved with status
+`waiting` and resumed later, so waits of minutes or days survive restarts and deploys.
+
+| Mode | Config | Resumes | Output ports |
+|------|--------|---------|--------------|
+| `duration` | `duration`: `"90s"`, `"15m"`, `"1h30m"`, `"2d"`, or seconds | after that long | one (plain node) |
+| `until` | `until`: RFC 3339 timestamp or epoch milliseconds | at that time | one (plain node) |
+| `event` | `correlationKey`, optional `filter`, optional `timeout` | on a matching signal, or at the timeout | `received` / `timed_out` |
+
+`mode` can be omitted: it is inferred from the keys given. A time already in the past does
+not wait. All values accept `{{ }}` expressions, e.g. `"timeout": "{{ item.sla }}"`.
+
+```json
+{ "id": "wait-ack", "type": "wait", "data": {
+    "correlationKey": "ticket-{{ Webhook.body.id }}",
+    "filter": "signal.payload.status == 'ack'",
+    "timeout": "30m"
+} }
+```
+
+- **Signals**: `POST /signals` with `{ "key": "ticket-42", "payload": { "status": "ack" } }` resumes
+  every run of the tenant waiting on that key whose `filter` accepts it. The filter is a JMESPath
+  expression over `{ signal: { key, payload } }`, written without `{{ }}` (any `{{ }}` parts in it
+  are filled in when the wait starts). The payload is in the node's output as `signal`.
+- **Timeout**: without one, an event wait lasts until a signal arrives or the run is cancelled.
+  Route `received` and `timed_out` like an `If`'s ports; the output has `resumedBy`
+  (`timer`/`signal`), `startedAt`, `resumedAt`, and `timedOut: true` or `signal`.
+- **Once only**: whichever of the timer and the signal comes first wins; the other does nothing.
+- **Inside a Loop**: a Wait can sit in a Loop body. On resume the run replays from the top,
+  reusing the recorded outputs of everything that already ran, and continues from the waiting
+  iteration. This is how an escalation matrix is modelled: a Loop over the levels, each one
+  notifying and then waiting for an acknowledgement with that level's SLA as the timeout.
+- **Persistence**: a run that waits is always saved when it suspends, whatever its
+  `persistence` mode, and recorded in full from then on. `GET /executions/:id` shows what a
+  waiting run waits for under `wait` (`node_id`, `iteration`, `wake_at`, `correlation_key`).
+- **Step mode**: a Wait suspends the step; once resumed, that step completes and the run is
+  `paused` again.
+- **Cancel**: `POST /executions/:id/cancel`.
+- **WorkflowCall**: a called workflow cannot wait; if it suspends, it is cancelled and the
+  `WorkflowCall` node fails.
+
+Due timers are polled every `WAIT_POLL_INTERVAL_MS` (so a wait may run up to that much late),
+and at most `WAIT_RESUME_CONCURRENCY` resumed runs execute at a time. Several replicas can poll
+the same database safely. Custom node types can suspend too: implement `NodeExecutor::run` to
+return `NodeOutcome::Suspend(SuspendSpec { wake_at, correlation_key, filter, state })`, and
+`resume` to continue from `state`.
 
 ## Node templates
 
@@ -346,3 +398,5 @@ Omit the header to see all tenants when listing; for create, tenant must be prov
 - `DATABASE_URL` – Postgres connection string (default: `postgres://localhost/workflow_engine`)
 - `PORT` – Server port (default: 3000)
 - `RUST_LOG` – Log level (default: `workflow_engine=info,tower_http=info`)
+- `WAIT_POLL_INTERVAL_MS` – How often due [waits](#waiting-durable-timers-and-signals) are polled (default: 1000)
+- `WAIT_RESUME_CONCURRENCY` – Maximum resumed runs executing at once (default: 4)
