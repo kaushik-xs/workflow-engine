@@ -307,6 +307,41 @@ fn runtime() -> &'static Runtime {
             )),
         );
 
+        // chunk(array_or_null, size) -> array of arrays
+        // Split an array into consecutive batches of at most `size` elements; the last batch
+        // holds the remainder. JMESPath slices only take literal bounds, so batches cannot be
+        // cut in-expression. Feeds a Loop that sends a long list to a size-limited bulk endpoint:
+        //   Loop items: `chunk(rows, `200`)`, body: `item`
+        // `null` and `[]` both yield `[]` (so the Loop runs zero times). `size` must be a
+        // positive whole number.
+        rt.register_function(
+            "chunk",
+            Box::new(CustomFunction::new(
+                Signature::new(vec![ArgumentType::Any, ArgumentType::Number], None),
+                Box::new(|args: &[Rcvar], _ctx| {
+                    let size = args[1].as_number().expect("validated as number");
+                    if size < 1.0 || size.fract() != 0.0 {
+                        return Err(fn_error(
+                            "chunk: size must be a positive whole number".to_string(),
+                        ));
+                    }
+                    let out: Vec<Rcvar> = if let Some(items) = args[0].as_array() {
+                        items
+                            .chunks(size as usize)
+                            .map(|c| Rcvar::new(jmespath::Variable::Array(c.to_vec())))
+                            .collect()
+                    } else if args[0].is_null() {
+                        Vec::new()
+                    } else {
+                        return Err(fn_error(
+                            "chunk: first argument must be an array or null".to_string(),
+                        ));
+                    };
+                    Ok(Rcvar::new(jmespath::Variable::Array(out)))
+                }),
+            )),
+        );
+
         // now() -> string
         // Current UTC time as an RFC 3339 string with millisecond precision,
         // e.g. `"2026-09-24T10:15:00.123Z"`. Evaluated fresh on every call.
@@ -747,6 +782,28 @@ mod tests {
     fn parse_json_errors_on_malformed_input() {
         let ctx = serde_json::json!({ "Webhook": { "body": { "assignees": "not json" } } });
         assert!(evaluate("parse_json(Webhook.body.assignees)", &ctx).is_err());
+    }
+
+    #[test]
+    fn chunk_splits_into_batches_of_at_most_size() {
+        let ctx = serde_json::json!({ "rows": [1, 2, 3, 4, 5] });
+        assert_eq!(
+            evaluate("chunk(rows, `2`)", &ctx).unwrap(),
+            serde_json::json!([[1, 2], [3, 4], [5]])
+        );
+        // Exact multiple and oversized batch.
+        assert_eq!(evaluate("chunk(rows, `5`)", &ctx).unwrap(), serde_json::json!([[1, 2, 3, 4, 5]]));
+        assert_eq!(evaluate("chunk(rows, `200`)", &ctx).unwrap(), serde_json::json!([[1, 2, 3, 4, 5]]));
+        // Empty and absent inputs give no batches.
+        assert_eq!(evaluate("chunk(`[]`, `200`)", &ctx).unwrap(), serde_json::json!([]));
+        assert_eq!(evaluate("chunk(missing, `200`)", &ctx).unwrap(), serde_json::json!([]));
+        // Works on the result of a projection.
+        assert_eq!(
+            evaluate("chunk(rows[*].{n: @}, `4`)[1]", &ctx).unwrap(),
+            serde_json::json!([{ "n": 5 }])
+        );
+        assert!(evaluate("chunk(rows, `0`)", &ctx).is_err());
+        assert!(evaluate("chunk(rows, `1.5`)", &ctx).is_err());
     }
 
     #[test]
