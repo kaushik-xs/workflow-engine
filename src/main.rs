@@ -173,6 +173,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    // Credentials come from the credential store when a node needs them; none are kept here.
+    workflow_engine::credentials::init(pool.clone());
+
     let node_registry: Arc<dyn NodeRegistry> =
         DefaultNodeRegistry::new_arc(Arc::new(pool.clone()));
 

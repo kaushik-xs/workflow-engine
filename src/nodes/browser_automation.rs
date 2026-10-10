@@ -14,6 +14,9 @@
 //!   - `inputs`: outputs of upstream steps, available to the automation as `inputs.*`.
 //!   - `env`, `secrets`: objects available as `env.*` / `secrets.*`. Secrets are masked by
 //!     hawk and never stored by it; keep them out of the definition with `{{ global.x }}`.
+//!   - `credentials`: credential-store names hawk resolves itself and exposes as
+//!     `secrets.<alias>.<field>` — `["dcs"]`, `"dcs"` or `{ "alias": "name" }`. The values
+//!     never pass through the engine. Also accepted inside `session` for its login.
 //!   - `environment`: a stored hawk environment to load `env` from (`env` overrides it).
 //!   - `session`: a live session handle to run in (string), or
 //!     `{ "slug", "key"?, "params"?, "secrets"?, "env"?, "environment"? }` to sign in
@@ -113,6 +116,27 @@ fn non_empty_str(config: &Value, key: &str) -> Option<String> {
     config.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
+/// `credentials` as `{ alias: name }`, from a name, a list of names or that object.
+fn credential_refs(config: &Value) -> Result<Option<Value>, String> {
+    let refs: Map<String, Value> = match config.get("credentials") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(n)) => [(n.trim().to_string(), json!(n.trim()))].into_iter().collect(),
+        Some(Value::Array(list)) => list
+            .iter()
+            .map(|v| v.as_str().map(|n| (n.trim().to_string(), json!(n.trim()))).ok_or("`credentials` names must be strings"))
+            .collect::<Result<_, _>>()?,
+        Some(Value::Object(m)) => m.clone(),
+        Some(other) => return Err(format!("`credentials` must be a name, a list of names or {{ alias: name }}, got {other}")),
+    };
+    for (alias, name) in &refs {
+        let ok = name.as_str().is_some_and(crate::credentials::valid_name);
+        if !ok || alias.is_empty() {
+            return Err(format!("`credentials`: \"{alias}\" must name a credential (lowercase letters, digits, _)"));
+        }
+    }
+    Ok((!refs.is_empty()).then_some(Value::Object(refs)))
+}
+
 fn object(config: &Value, key: &str) -> Result<Option<Value>, String> {
     match config.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -167,6 +191,9 @@ impl Settings {
                 request.insert(key.into(), v);
             }
         }
+        if let Some(refs) = credential_refs(config)? {
+            request.insert("credentials".into(), refs);
+        }
         for key in ["environment", "mode"] {
             if let Some(v) = non_empty_str(config, key) {
                 request.insert(key.into(), json!(v));
@@ -194,6 +221,9 @@ impl Settings {
                     }
                     if let Some(env) = non_empty_str(v, "environment") {
                         body.insert("environment".into(), json!(env));
+                    }
+                    if let Some(refs) = credential_refs(v).map_err(|e| e.replace("`credentials`", "`session.credentials`"))? {
+                        body.insert("credentials".into(), refs);
                     }
                     if let Some(k) = &key {
                         body.insert("key".into(), json!(k));
@@ -368,7 +398,24 @@ impl NodeExecutor for BrowserAutomationExecutor {
         _input: Value,
         config: Value,
     ) -> Result<NodeOutcome, String> {
-        let settings = Settings::parse(&config, ctx)?;
+        let mut settings = Settings::parse(&config, ctx)?;
+        // Credentials go to hawk by name, with the tenant and run to resolve and log them for.
+        let session_refs = matches!(&settings.session, Session::Acquire { body, .. } if body.get("credentials").is_some());
+        if settings.request.contains_key("credentials") || session_refs {
+            let client = crate::credentials::client().ok_or("credentials are not available in this engine")?;
+            let tenant = client.tenant_of(ctx.workflow_id).await?;
+            let context = json!({ "workflowId": ctx.workflow_id, "executionId": ctx.execution_id, "nodeId": node_id });
+            if settings.request.contains_key("credentials") {
+                settings.request.insert("credentialTenant".into(), json!(tenant));
+                settings.request.insert("credentialContext".into(), context.clone());
+            }
+            if let Session::Acquire { body: Value::Object(b), .. } = &mut settings.session {
+                if b.contains_key("credentials") {
+                    b.insert("credentialTenant".into(), json!(tenant));
+                    b.insert("credentialContext".into(), context);
+                }
+            }
+        }
         let automation = settings.request["automation"].as_str().unwrap_or_default().to_string();
         let mut request = settings.request;
 

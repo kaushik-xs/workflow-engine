@@ -1,10 +1,11 @@
+use crate::credentials;
 use crate::definition::{self, EdgeSpec, NodeSpec};
 use crate::expression;
 use crate::nodes::{NodeExecutor, NodeOutcome, ResumeReason, SuspendSpec};
 use crate::persistence::Recorder;
 use crate::registry::NodeRegistry;
 use crate::storage::{self, WorkflowWait};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -477,9 +478,39 @@ async fn execute_node(
         config_before = ?config,
         "interpolating node input and config"
     );
+    // Credentials the node reads are resolved now, for this node only: they go into
+    // the expression scope, never into the context, and are masked out of its result.
+    let wanted = {
+        let mut names = credentials::referenced(&config);
+        names.extend(credentials::referenced(&input));
+        if let Some(p) = &node.params {
+            names.extend(credentials::referenced(p));
+        }
+        names.sort();
+        names.dedup();
+        names
+    };
+    let mut resolved = Map::new();
+    if !wanted.is_empty() {
+        let client = credentials::client().ok_or("credentials are not available in this engine")?;
+        let tenant = client.tenant_of(exec_ctx.workflow_id).await?;
+        for name in &wanted {
+            let context = serde_json::json!({
+                "workflowId": exec_ctx.workflow_id,
+                "executionId": exec_ctx.execution_id,
+                "nodeId": node.id,
+                "nodeType": node.node_type,
+            });
+            resolved.insert(name.clone(), Value::Object(client.resolve(&tenant, name, context).await?));
+        }
+    }
+    let secrets = credentials::secrets_of(&resolved);
     // One scope for both: converting the context is the expensive part.
     if expression::has_expressions(&input) || expression::has_expressions(&config) {
         let mut scope = expression::Scope::new(&exec_ctx.context)?;
+        if !resolved.is_empty() {
+            scope = scope.with("credentials", &Value::Object(resolved.clone()))?;
+        }
         // A node expanded from a template reads its params as `params.*`. Param values may
         // themselves be expressions, evaluated against the workflow's context first.
         if let Some(params) = &node.params {
@@ -495,11 +526,22 @@ async fn execute_node(
         execution_id = %exec_ctx.execution_id,
         node_id = %node.id,
         node_type = %node.node_type,
-        input_after = ?input,
-        config_after = ?config,
+        input_after = ?credentials::mask(&input, &secrets),
+        config_after = ?credentials::mask(&config, &secrets),
         "interpolated node input and config"
     );
-    executor.run(exec_ctx, &node.id, input, config).await
+    let result = executor.run(exec_ctx, &node.id, input, config).await;
+    if secrets.is_empty() {
+        return result;
+    }
+    match result {
+        Ok(NodeOutcome::Complete(out)) => Ok(NodeOutcome::Complete(credentials::mask(&out, &secrets))),
+        Ok(NodeOutcome::Suspend(mut spec)) => {
+            spec.state = credentials::mask(&spec.state, &secrets);
+            Ok(NodeOutcome::Suspend(spec))
+        }
+        Err(e) => Err(credentials::mask_text(&e, &secrets)),
+    }
 }
 
 /// Resolve a Loop's `items` into the list to iterate. An expression that yields `null`
