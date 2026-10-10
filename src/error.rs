@@ -17,6 +17,10 @@ pub enum AppError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// An upstream service (e.g. hawk) is down or failed.
+    #[error("bad gateway: {0}")]
+    BadGateway(String),
+
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -33,6 +37,7 @@ impl IntoResponse for AppError {
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
+            AppError::BadGateway(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
         let body = Json(ErrorBody { error: message });

@@ -9,7 +9,10 @@
     { "key": "workflow_id", "value": "", "type": "string" },
     { "key": "execution_id", "value": "", "type": "string" },
     { "key": "tenant", "value": "", "type": "string", "description": "Required for create (non-empty). Optional for list/get/trigger to scope by tenant." },
-    { "key": "template_slug", "value": "create-ticket", "type": "string", "description": "Node template slug. Set by Create/Publish Node Template." }
+    { "key": "template_slug", "value": "create-ticket", "type": "string", "description": "Node template slug. Set by Create/Publish Node Template." },
+    { "key": "browser_automation", "value": "", "type": "string", "description": "Hawk automation id, from List Browser Automations." },
+    { "key": "hawk_run_id", "value": "", "type": "string", "description": "`runId` from a BrowserAutomation node's output." },
+    { "key": "artifact_name", "value": "", "type": "string", "description": "An artifact `name` from that run." }
   ],
   "item": [
     {
@@ -413,6 +416,48 @@
             ],
             "url": "{{base_url}}/node-templates/{{template_slug}}",
             "description": "Delete the template, or one version with `?version=N`. 409 while workflow nodes still use it (for one version: nodes pinned to it, or following latest when it is the latest)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Browser Automations",
+      "description": "Automations a `browserAutomation` node can run, served from hawk (`HAWK_URL`). Use one in a workflow with a node `{ \"type\": \"browserAutomation\", \"data\": { \"automation\": \"<id>\", \"params\": {...} } }`.",
+      "item": [
+        {
+          "name": "List Browser Automations",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/browser-automations",
+            "description": "Published hawk automations with their `params` schema. Optional `?system=` / `?process=` filters."
+          }
+        },
+        {
+          "name": "Get Browser Automation",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/browser-automations/{{browser_automation}}",
+            "description": "One automation by id."
+          }
+        },
+        {
+          "name": "Get Browser Automation Run",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/browser-automations/runs/{{hawk_run_id}}",
+            "description": "A hawk run: status, output, error, artifacts. The id is `runId` in a BrowserAutomation node's output."
+          }
+        },
+        {
+          "name": "Get Browser Automation Artifact",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/browser-automations/runs/{{hawk_run_id}}/artifacts/{{artifact_name}}",
+            "description": "A file the run produced, e.g. a downloaded PDF or a failure screenshot."
           }
         }
       ]

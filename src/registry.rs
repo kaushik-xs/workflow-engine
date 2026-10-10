@@ -2,8 +2,9 @@ use crate::nodes::NodeExecutor;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
+use crate::hawk::HawkClient;
 use crate::nodes::{
-    HttpRequestExecutor, HttpTriggerExecutor, IfExecutor, MergeExecutor, ServiceCallExecutor,
+    BrowserAutomationExecutor, HttpRequestExecutor, HttpTriggerExecutor, IfExecutor, MergeExecutor, ServiceCallExecutor,
     SetVariableExecutor, SwitchExecutor, WaitExecutor, WorkflowCallExecutor,
 };
 
@@ -11,7 +12,8 @@ pub trait NodeRegistry: Send + Sync {
     fn get(&self, node_type: &str) -> Option<Arc<dyn NodeExecutor>>;
 }
 
-/// Default registry with HttpTrigger, HttpRequest, Merge, ServiceCall, SetVariable registered.
+/// Default registry with HttpTrigger, HttpRequest, Merge, ServiceCall, SetVariable, Wait and
+/// BrowserAutomation registered.
 /// WorkflowCall needs a reference to the registry itself, so it is only wired up by
 /// [`DefaultNodeRegistry::new_arc`] (see below).
 pub struct DefaultNodeRegistry {
@@ -26,6 +28,10 @@ impl DefaultNodeRegistry {
         map.insert("Merge".to_string(), Arc::new(MergeExecutor));
         map.insert("If".to_string(), Arc::new(IfExecutor));
         map.insert("Switch".to_string(), Arc::new(SwitchExecutor));
+        map.insert(
+            "BrowserAutomation".to_string(),
+            Arc::new(BrowserAutomationExecutor::new(Arc::new(HawkClient::new(pool.clone())))),
+        );
         let service_call: Arc<dyn NodeExecutor> = match pool {
             Some(p) => Arc::new(ServiceCallExecutor::new(p)),
             None => Arc::new(ServiceCallExecutor::default()),

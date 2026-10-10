@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 pub use crate::executor::ExecutionContext;
+pub use browser_automation::BrowserAutomationExecutor;
 pub use http_request::HttpRequestExecutor;
 pub use http_trigger::HttpTriggerExecutor;
 pub use if_node::IfExecutor;
@@ -15,6 +16,7 @@ pub use workflow_call::WorkflowCallExecutor;
 
 pub(crate) use condition::truthy;
 
+mod browser_automation;
 mod condition;
 mod http_body;
 mod http_request;

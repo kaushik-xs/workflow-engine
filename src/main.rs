@@ -13,6 +13,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 use workflow_engine::error::AppError;
 use workflow_engine::executor;
+use workflow_engine::hawk::{self, HawkClient, HawkError};
 use workflow_engine::persistence::{Persistence, Recorder};
 use workflow_engine::registry::{DefaultNodeRegistry, NodeRegistry};
 use workflow_engine::storage;
@@ -25,6 +26,7 @@ struct AppState {
     pool: sqlx::PgPool,
     node_registry: Arc<dyn NodeRegistry>,
     waits: Arc<Waits>,
+    hawk: Arc<HawkClient>,
 }
 
 #[derive(Serialize)]
@@ -186,6 +188,7 @@ async fn main() -> Result<(), anyhow::Error> {
         pool: pool.clone(),
         node_registry,
         waits,
+        hawk: Arc::new(HawkClient::new(Some(Arc::new(pool.clone())))),
     };
 
     let app = Router::new()
@@ -207,6 +210,13 @@ async fn main() -> Result<(), anyhow::Error> {
         )
         .route("/node-templates/:slug/versions", get(list_node_template_versions))
         .route("/node-templates/:slug/usages", get(list_node_template_usages))
+        .route("/browser-automations", get(list_browser_automations))
+        .route("/browser-automations/:id", get(get_browser_automation))
+        .route("/browser-automations/runs/:run_id", get(get_browser_automation_run))
+        .route(
+            "/browser-automations/runs/:run_id/artifacts/:name",
+            get(get_browser_automation_artifact),
+        )
         .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state);
@@ -1125,4 +1135,75 @@ async fn delete_node_template(
         "version": query.version,
         "deleted": deleted,
     })))
+}
+
+// ── Browser automations (hawk) ────────────────────────────────────────────────
+
+fn hawk_error(e: HawkError) -> AppError {
+    match e {
+        HawkError::Status(404, m) => AppError::NotFound(m),
+        HawkError::Status(s, m) if (400..500).contains(&s) => AppError::BadRequest(m),
+        e => AppError::BadGateway(e.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BrowserAutomationQuery {
+    system: Option<String>,
+    process: Option<String>,
+}
+
+/// GET /browser-automations: the automations a BrowserAutomation node can run (hawk's
+/// published steps), with the `params` each expects. Filter with `?system=` / `?process=`.
+async fn list_browser_automations(
+    State(state): State<AppState>,
+    Query(q): Query<BrowserAutomationQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let matches = |field: &serde_json::Value, want: &Option<String>| match want {
+        None => true,
+        Some(w) => field.as_str().is_some_and(|f| f.eq_ignore_ascii_case(w.trim())),
+    };
+    let automations: Vec<_> = state
+        .hawk
+        .catalog()
+        .await
+        .map_err(hawk_error)?
+        .iter()
+        .map(hawk::describe)
+        .filter(|a| matches(&a["system"], &q.system) && matches(&a["process"], &q.process))
+        .collect();
+    Ok(Json(serde_json::json!({ "automations": automations })))
+}
+
+/// GET /browser-automations/:id: one automation from the catalog.
+async fn get_browser_automation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let catalog = state.hawk.catalog().await.map_err(hawk_error)?;
+    let step = catalog
+        .iter()
+        .find(|s| s["id"] == id.as_str())
+        .ok_or_else(|| AppError::NotFound(format!("no published browser automation \"{id}\"")))?;
+    Ok(Json(hawk::describe(step)))
+}
+
+/// GET /browser-automations/runs/:run_id: a hawk run as hawk reports it (status, output,
+/// error, artifacts), so callers need no direct access to hawk.
+async fn get_browser_automation_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(state.hawk.get_run(&run_id).await.map_err(hawk_error)?))
+}
+
+/// GET /browser-automations/runs/:run_id/artifacts/:name: a file a run produced.
+async fn get_browser_automation_artifact(
+    State(state): State<AppState>,
+    Path((run_id, name)): Path<(String, String)>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+    let file = state.hawk.artifact(&run_id, &name).await.map_err(hawk_error)?;
+    let content_type = file.content_type.unwrap_or_else(|| "application/octet-stream".into());
+    Ok(([(axum::http::header::CONTENT_TYPE, content_type)], file.bytes).into_response())
 }

@@ -55,6 +55,10 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 | GET | /node-templates/:slug/versions | Every version, newest first. |
 | GET | /node-templates/:slug/usages | Workflow nodes using the template, with `floating`/`pinned` counts. |
 | DELETE | /node-templates/:slug | Delete the template (or `?version=N`). 409 while workflows still use it. |
+| GET | /browser-automations | The [browser automations](#browser-automations) a `BrowserAutomation` node can run (hawk's published steps), each with its `params` schema. Filter with `?system=<manifest system>` / `?process=<hawk process>`. Returns `{ "automations": [{ "id", "name", "label", "system", "summary", "process", "version", "writes", "irreversible", "params", "manifest", "publishedAt" }] }`. 502 when hawk is unreachable. |
+| GET | /browser-automations/:id | One automation from that list (404 if it has no published version). |
+| GET | /browser-automations/runs/:run_id | A hawk run (`status`, `output`, `error`, `artifacts`, …), as hawk reports it. |
+| GET | /browser-automations/runs/:run_id/artifacts/:name | A file the run produced (screenshot, download), with its content type. |
 
 ## Versioning and latest
 
@@ -75,6 +79,7 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 - **Loop** – Container that runs the nodes inside it once per item (config: `items`, an expression returning a list). See [Loops](#loops).
 - **Wait** – Suspends the run for a time, until a time, or until a signal arrives (with an optional timeout). See [Waiting](#waiting-durable-timers-and-signals).
 - **Template** – A reference to a shared [node template](#node-templates) (config: `template`, optional `version`, `params`).
+- **BrowserAutomation** – Runs a hawk browser automation (config: `automation`, `params`, optional `session`, `mode`, …). See [Browser automations](#browser-automations).
 
 ### Branching
 
@@ -227,6 +232,80 @@ and at most `WAIT_RESUME_CONCURRENCY` resumed runs execute at a time. Several re
 the same database safely. Custom node types can suspend too: implement `NodeExecutor::run` to
 return `NodeOutcome::Suspend(SuspendSpec { wake_at, correlation_key, filter, state })`, and
 `resume` to continue from `state`.
+
+## Browser automations
+
+A **BrowserAutomation** node runs any automation published in hawk (`hawkd`, the
+browser-automation service in the `automation/hawk` repo) in a headless browser, and returns its
+result. The node is generic: it knows nothing about particular sites or automations. Whatever
+hawk can run (form filling, scraping, report downloads, uploads, on any website) the node can
+call, passing the automation id and the inputs it declares. The engine only uses hawkd's existing
+HTTP API (`POST /v1/runs`, `GET /v1/runs/:id`, …); hawk itself is unchanged, and its other
+clients keep using it as before.
+
+**Where hawk is:** the `hawk` entry of the service registry if there is one, otherwise
+`HAWK_URL`, otherwise `http://127.0.0.1:7878`. hawkd has no auth of its own, so keep it on a
+private network.
+
+**Choosing an automation:** `GET /browser-automations` lists what can run, with each one's
+`params` schema (`{ name: { type, required, default, description, enum } }`) for building the
+node's form. Only published versions are listed. A new automation is a `hawk/v1` config created
+with hawk's `POST /v1/automations` and published with `POST /v1/automations/:id/versions/:v/publish`
+(or pushed with `npm run hawk:push -- --publish`); it shows up here once published. Automations not
+tied to one of hawk's existing processes go under its `shared` process.
+
+| Config | Default | |
+|---|---|---|
+| `automation` | (required) | Automation id, as listed by `GET /browser-automations`. |
+| `params` | `{}` | The automation's params. hawk checks them (and its guards) before opening a browser. |
+| `version` | published | Run a specific version, e.g. a draft being tried out. |
+| `inputs` | – | Upstream outputs, available to the automation as `inputs.*`. |
+| `env` / `secrets` | – | Objects available as `env.*` / `secrets.*`. hawk masks secrets and never stores them; reference them with `{{ global.x }}` rather than writing them into the definition. |
+| `environment` | – | A stored hawk environment to take `env` from (`env` overrides it). |
+| `session` | fresh browser | A live session handle, or `{ "slug", "key"?, "params"?, "secrets"?, "env"?, "environment"? }` to sign in through hawk's stored session first. Without `key` that session is closed when the run ends; with one it is kept for reuse. Use this for sites that need a login. |
+| `mode` | `live` | `dry` stops before the first write (and counts as success); `mock` opens no browser. |
+| `actor` | `workflow-engine:<workflow id>` | Recorded on the hawk run. |
+| `timeout` | `30m` | Give up and cancel the run after this long. |
+| `inlineFor` | `60s` | Wait this long in the request; a run still going then suspends the workflow. `0` suspends at once. |
+| `pollInterval` / `durablePollInterval` | `2s` / `15s` | How often the run is checked in the request / while suspended. |
+| `failOnError` | `true` | Fail the node unless the run passed. With `false` it completes and `ok` tells the outcome (route it with an `If`). |
+| `downloadArtifacts` | `false` | Add each artifact's bytes as `{ filename, contentType, base64 }` (up to 20 MB each), the shape a `formdata` file row takes. |
+
+Durations use the [Wait](#waiting-durable-timers-and-signals) format. All values accept `{{ }}`.
+
+```json
+{ "id": "eta", "type": "browserAutomation", "data": {
+    "automation": "download-report",
+    "params": {
+      "from": "{{ Webhook.body.from }}",
+      "to": "{{ Webhook.body.to }}",
+      "fileName": "report-{{ Webhook.body.from }}.pdf"
+    },
+    "session": { "slug": "portal", "key": "{{ global.portalUser }}", "secrets": { "password": "{{ global.portalPassword }}" } },
+    "downloadArtifacts": true
+} }
+```
+
+Output, available as `{{ nodes.<id>.* }}`:
+
+```json
+{ "runId": "…", "automation": "download-report", "version": 4, "mode": "live",
+  "status": "passed", "ok": true, "output": { … }, "error": null,
+  "artifacts": [{ "name": "report-2026-10-01.pdf", "kind": "download", "bytes": 48213, "sha256": "…", "url": "http://hawk/v1/runs/…/artifacts/report-2026-10-01.pdf" }],
+  "startedAt": "…", "endedAt": "…", "session": "…" }
+```
+
+`status` is hawk's: `passed`, `failed`, `rejected` (params or guards refused it),
+`stopped-before-write` or `cancelled`. A failure reads e.g.
+`browser automation "download-report" failed: locator #from not found at steps[2] (hawk run …)`.
+
+- **Long runs** suspend like a [Wait](#waiting-durable-timers-and-signals): the webhook answers
+  `waiting`, the run is checked by the timer worker until it ends, and the workflow continues.
+  They survive restarts on both sides (hawk marks a run its restart interrupted as failed).
+- **WorkflowCall**: a called workflow cannot suspend, so give a BrowserAutomation inside one an
+  `inlineFor` as long as its `timeout`, and keep that under the caller's request timeout (300 s).
+- **Hawk down**: up to 5 consecutive failed checks are retried before the node fails and the run
+  is cancelled.
 
 ## Node templates
 
@@ -400,3 +479,4 @@ Omit the header to see all tenants when listing; for create, tenant must be prov
 - `RUST_LOG` – Log level (default: `workflow_engine=info,tower_http=info`)
 - `WAIT_POLL_INTERVAL_MS` – How often due [waits](#waiting-durable-timers-and-signals) are polled (default: 1000)
 - `WAIT_RESUME_CONCURRENCY` – Maximum resumed runs executing at once (default: 4)
+- `HAWK_URL` – hawkd's base URL for [browser automations](#browser-automations) (default: `http://127.0.0.1:7878`; a `hawk` service registry entry overrides it)
