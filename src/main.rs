@@ -14,11 +14,16 @@ use uuid::Uuid;
 use workflow_engine::error::AppError;
 use workflow_engine::executor;
 use workflow_engine::hawk::{self, HawkClient, HawkError};
-use workflow_engine::persistence::{Persistence, Recorder};
+use workflow_engine::persistence::Persistence;
 use workflow_engine::registry::{DefaultNodeRegistry, NodeRegistry};
-use workflow_engine::storage;
+use workflow_engine::roles::{self, Roles};
+use workflow_engine::run_queue::{self, RunWorker};
+use workflow_engine::schedule::{CronSchedule, ScheduleSpec};
+use workflow_engine::scheduler::Scheduler;
+use workflow_engine::runs::{self, RunOutcome, StartRun};
+use workflow_engine::storage::{self, ExecutionFilter};
 use workflow_engine::templates;
-use workflow_engine::triggers;
+use workflow_engine::triggers::{self, RunOrigin, TriggerKind};
 use workflow_engine::waits::Waits;
 
 #[derive(Clone)]
@@ -53,14 +58,6 @@ struct WorkflowListItem {
 }
 
 #[derive(Serialize)]
-struct WebhookResponse {
-    execution_id: Uuid,
-    status: String,
-    result: Option<serde_json::Value>,
-    error: Option<String>,
-}
-
-#[derive(Serialize)]
 struct ExecutionResponse {
     id: Uuid,
     workflow_id: Uuid,
@@ -69,6 +66,9 @@ struct ExecutionResponse {
     context: serde_json::Value,
     started_at: String,
     finished_at: Option<String>,
+    trigger: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule_id: Option<Uuid>,
     steps: Vec<StepItem>,
     /// What a `waiting` execution is waiting for; omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,6 +108,9 @@ struct ExecutionListItem {
     context: serde_json::Value,
     started_at: String,
     finished_at: Option<String>,
+    trigger: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -164,10 +167,17 @@ async fn main() -> Result<(), anyhow::Error> {
     // Set LOG_FORMAT=text (or pretty) for human-readable local logs.
     workflow_engine::logging::init("workflow_engine=info,tower_http=info");
 
+    let env_num = |key: &str, default: u64| {
+        std::env::var(key).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(default)
+    };
+    let roles = Roles::parse(&std::env::var("ENGINE_ROLES").unwrap_or_else(|_| roles::DEFAULT_ROLES.into()))
+        .map_err(anyhow::Error::msg)?;
+    tracing::info!(roles = %roles.names(), "starting");
+
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/workflow_engine".into());
     let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(env_num("DATABASE_MAX_CONNECTIONS", 5).max(1) as u32)
         .connect(&database_url)
         .await?;
 
@@ -179,13 +189,29 @@ async fn main() -> Result<(), anyhow::Error> {
     let node_registry: Arc<dyn NodeRegistry> =
         DefaultNodeRegistry::new_arc(Arc::new(pool.clone()));
 
-    // Resume runs suspended by a Wait node: due timers are polled here, signals arrive on
-    // POST /signals.
-    let env_num = |key: &str, default: u64| {
-        std::env::var(key).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(default)
-    };
+    // Resume runs suspended by a Wait node: workers poll for due timers; signals arrive on
+    // POST /signals, in the API.
     let waits = Waits::new(pool.clone(), node_registry.clone(), env_num("WAIT_RESUME_CONCURRENCY", 4) as usize);
-    waits.spawn_timer_worker(std::time::Duration::from_millis(env_num("WAIT_POLL_INTERVAL_MS", 1000).max(100)));
+
+    if roles.worker {
+        waits.spawn_timer_worker(std::time::Duration::from_millis(env_num("WAIT_POLL_INTERVAL_MS", 1000).max(100)));
+        RunWorker::new(pool.clone(), node_registry.clone(), env_num("RUN_WORKER_CONCURRENCY", 4) as usize)
+            .spawn(std::time::Duration::from_millis(env_num("RUN_QUEUE_IDLE_POLL_MS", 500).max(50)));
+    }
+    if roles.scheduler {
+        Scheduler::new(
+            pool.clone(),
+            std::time::Duration::from_secs(env_num("SCHEDULE_MISFIRE_GRACE_SECS", 60)),
+            std::time::Duration::from_secs(env_num("SCHEDULE_RUN_LEASE_SECS", 3600)),
+            env_num("SCHEDULER_BATCH", 100) as usize,
+        )
+        .spawn(std::time::Duration::from_millis(env_num("SCHEDULER_POLL_INTERVAL_MS", 1000).max(100)));
+    }
+    if !roles.api {
+        // No HTTP server; the background roles above run until the process is stopped.
+        tokio::signal::ctrl_c().await?;
+        return Ok(());
+    }
 
     let state = AppState {
         pool: pool.clone(),
@@ -206,6 +232,10 @@ async fn main() -> Result<(), anyhow::Error> {
         .route("/executions/:id/step", post(run_next_step_handler))
         .route("/executions/:id/cancel", post(cancel_execution))
         .route("/signals", post(send_signal))
+        .route("/schedules", get(list_schedules).post(create_schedule))
+        .route("/schedules/preview", post(preview_schedule))
+        .route("/schedules/:id", get(get_schedule).put(put_schedule).delete(delete_schedule))
+        .route("/schedules/:id/run", post(run_schedule))
         .route("/node-templates", get(list_node_templates).post(create_node_template))
         .route(
             "/node-templates/:slug",
@@ -442,6 +472,9 @@ struct WebhookQuery {
     step: Option<bool>,
     /// Overrides the workflow's `persistence` for this call: `full`, `errors_only` or `none`.
     persist: Option<String>,
+    /// Queue the run for a worker and return at once with its `execution_id`.
+    #[serde(rename = "async")]
+    queue: Option<bool>,
 }
 
 /// Maximum number of executions returnable in a single page.
@@ -460,6 +493,10 @@ struct ExecutionsQuery {
     limit: Option<i64>,
     /// Rows to skip for pagination. Defaults to 0.
     offset: Option<i64>,
+    /// Only executions started this way: `webhook`, `schedule` or `workflow_call`.
+    trigger: Option<String>,
+    /// Only executions started by this schedule.
+    schedule_id: Option<Uuid>,
 }
 
 async fn trigger_webhook(
@@ -468,7 +505,7 @@ async fn trigger_webhook(
     Query(query): Query<WebhookQuery>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<WebhookResponse>, AppError> {
+) -> Result<Json<RunOutcome>, AppError> {
     let tenant_header = tenant_from_headers(&headers);
     let tenant = tenant_header.as_deref();
     let version = query.version;
@@ -488,116 +525,27 @@ async fn trigger_webhook(
         }
     }
 
-    let webhook_context = triggers::webhook_context_from_request(body, &headers);
-    // Snapshot the tenant's globals and seed the workflow's declared local variables into
-    // the persisted execution context (used by both immediate and step-mode runs).
-    let mut initial_context = executor::build_initial_context(
-        &state.pool,
-        &workflow.tenant,
-        &workflow.definition,
-        webhook_context,
-    )
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
-    let step_mode = query.step == Some(true);
-    let persistence = match query.persist.as_deref() {
-        Some(p) => Persistence::parse(p),
-        None => Persistence::from_definition(&workflow.definition),
-    }
-    .map_err(AppError::BadRequest)?;
-
-    // Expand template references now; the versions used are recorded in the context.
-    let resolved =
-        templates::resolve_definition(&state.pool, &workflow.tenant, &workflow.definition, None).await;
-    let definition = match resolved {
-        Ok(resolved) => {
-            templates::record_lock(&mut initial_context, resolved.lock);
-            resolved.definition
-        }
-        Err(e) if step_mode => return Err(AppError::BadRequest(e)),
-        Err(e) => {
-            // Record it like any other failure that stops a run before its first node.
-            let recorder = Recorder::start(
-                &state.pool,
-                persistence,
-                workflow.id,
-                Some(workflow.version),
-                &initial_context,
-            )
-            .await
-            .map_err(AppError::from)?;
-            recorder
-                .fail(&initial_context)
-                .await
-                .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
-            return Ok(Json(WebhookResponse {
-                execution_id: recorder.execution_id(),
-                status: "failed".to_string(),
-                result: None,
-                error: Some(e),
-            }));
-        }
-    };
-
-    if step_mode {
-        // Step mode reloads state from the database between steps, so it is always saved.
-        let exec = storage::create_execution(
-            &state.pool,
-            workflow.id,
-            Some(workflow.version),
-            &initial_context,
-            Some("paused"),
-        )
-        .await
-        .map_err(AppError::from)?;
-        return Ok(Json(WebhookResponse {
-            execution_id: exec.id,
-            status: "paused".to_string(),
-            result: None,
-            error: None,
-        }));
-    }
-
-    let recorder = Recorder::start(
-        &state.pool,
+    let persistence = query
+        .persist
+        .as_deref()
+        .map(Persistence::parse)
+        .transpose()
+        .map_err(AppError::BadRequest)?;
+    let start = StartRun {
+        execution_id: None,
+        trigger_context: triggers::webhook_context_from_request(body, &headers),
+        origin: RunOrigin::WEBHOOK,
+        step_mode: query.step == Some(true),
         persistence,
-        workflow.id,
-        Some(workflow.version),
-        &initial_context,
-    )
-    .await
-    .map_err(AppError::from)?;
-
-    // Continue the caller's trace (from the incoming `traceparent`), or start a root.
-    let trace_id = workflow_engine::trace::resolve_trace_id(&headers);
-    let span = tracing::info_span!(
-        "execution",
-        trace_id = %trace_id,
-        execution_id = %recorder.execution_id(),
-        workflow_id = %workflow.id,
-    );
-    let run = executor::run_workflow(
-        &recorder,
-        state.node_registry.clone(),
-        &definition,
-        initial_context,
-        Some(trace_id.clone()),
-    )
-    .instrument(span)
-    .await;
-
-    let (status, result, error) = match run {
-        Ok(run) if run.waiting => ("waiting", None, None),
-        Ok(run) => ("completed", run.result, None),
-        Err(e) => ("failed", None, Some(e)),
+        // Continue the caller's trace (from the incoming `traceparent`), or start a root.
+        trace_id: workflow_engine::trace::resolve_trace_id(&headers),
     };
-
-    Ok(Json(WebhookResponse {
-        execution_id: recorder.execution_id(),
-        status: status.to_string(),
-        result,
-        error,
-    }))
+    let outcome = if query.queue == Some(true) {
+        run_queue::enqueue(&state.pool, &workflow, start, None).await?
+    } else {
+        runs::start_run(&state.pool, state.node_registry.clone(), &workflow, start).await?
+    };
+    Ok(Json(outcome))
 }
 
 fn require_tenant(headers: &axum::http::HeaderMap) -> Result<String, AppError> {
@@ -718,17 +666,24 @@ async fn list_executions(
         _ => None,
     };
 
-    let rows = storage::list_executions(
-        &state.pool,
-        query.workflow_id,
+    let trigger = query
+        .trigger
+        .as_deref()
+        .map(TriggerKind::parse)
+        .transpose()
+        .map_err(AppError::BadRequest)?;
+    let filter = ExecutionFilter {
+        workflow_id: query.workflow_id,
         tenant,
         since,
-        limit,
-        offset,
-    )
-    .await
-    .map_err(AppError::from)?;
-    let total = storage::count_executions(&state.pool, query.workflow_id, tenant, since)
+        trigger,
+        schedule_id: query.schedule_id,
+    };
+
+    let rows = storage::list_executions(&state.pool, filter, limit, offset)
+        .await
+        .map_err(AppError::from)?;
+    let total = storage::count_executions(&state.pool, filter)
         .await
         .map_err(AppError::from)?;
     Ok(Json(ExecutionListResponse {
@@ -742,6 +697,8 @@ async fn list_executions(
                 context: e.context,
                 started_at: e.started_at.to_rfc3339(),
                 finished_at: e.finished_at.map(|t| t.to_rfc3339()),
+                trigger: e.trigger,
+                schedule_id: e.schedule_id,
             })
             .collect(),
         total,
@@ -760,7 +717,8 @@ async fn latest_execution_input(
 ) -> Result<Json<LatestInputResponse>, AppError> {
     let tenant_header = tenant_from_headers(&headers);
     let tenant = tenant_header.as_deref();
-    let rows = storage::list_executions(&state.pool, query.workflow_id, tenant, None, 1, 0)
+    let filter = ExecutionFilter { workflow_id: query.workflow_id, tenant, ..Default::default() };
+    let rows = storage::list_executions(&state.pool, filter, 1, 0)
         .await
         .map_err(AppError::from)?;
     let Some(exec) = rows.into_iter().next() else {
@@ -785,8 +743,57 @@ async fn get_execution(
     headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ExecutionResponse>, AppError> {
-    let exec = load_execution(&state, &headers, id).await?;
-    execution_response(&state.pool, exec).await.map(Json)
+    match load_execution(&state, &headers, id).await {
+        Ok(exec) => execution_response(&state.pool, exec).await.map(Json),
+        // A queued run has no execution row until a worker starts it.
+        Err(AppError::NotFound(_)) => queued_execution_response(&state, &headers, id).await.map(Json),
+        Err(e) => Err(e),
+    }
+}
+
+/// A run still in the queue, shown as an execution with status `queued` and no steps.
+async fn queued_execution_response(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    id: Uuid,
+) -> Result<ExecutionResponse, AppError> {
+    let run = load_queued_run(state, headers, id).await?;
+    Ok(ExecutionResponse {
+        id: run.id,
+        workflow_id: run.workflow_id,
+        workflow_version: None,
+        status: "queued".to_string(),
+        context: run.trigger_context,
+        started_at: run.enqueued_at.to_rfc3339(),
+        finished_at: None,
+        trigger: run.trigger,
+        schedule_id: run.schedule_id,
+        steps: Vec::new(),
+        wait: None,
+    })
+}
+
+/// The queued run, when it exists and belongs to the caller's tenant (if one is given).
+async fn load_queued_run(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    id: Uuid,
+) -> Result<storage::QueuedRun, AppError> {
+    let not_found = || AppError::NotFound("execution not found".into());
+    let run = storage::get_queued_run(&state.pool, id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(not_found)?;
+    if let Some(ref tenant) = tenant_from_headers(headers) {
+        let w = storage::get_workflow_by_id(&state.pool, run.workflow_id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(not_found)?;
+        if w.tenant != *tenant {
+            return Err(not_found());
+        }
+    }
+    Ok(run)
 }
 
 /// The execution, when it exists and belongs to the caller's tenant (if one is given).
@@ -831,6 +838,8 @@ async fn execution_response(
         context: exec.context,
         started_at: exec.started_at.to_rfc3339(),
         finished_at: exec.finished_at.map(|t| t.to_rfc3339()),
+        trigger: exec.trigger,
+        schedule_id: exec.schedule_id,
         steps: steps
             .into_iter()
             .map(|s| StepItem {
@@ -850,16 +859,28 @@ async fn execution_response(
     })
 }
 
-/// Cancel a waiting or paused execution: it will not resume.
+/// Cancel a queued, waiting or paused execution: it will not start or resume.
 async fn cancel_execution(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ExecutionResponse>, AppError> {
-    let exec = load_execution(&state, &headers, id).await?;
+    let exec = match load_execution(&state, &headers, id).await {
+        Ok(exec) => exec,
+        Err(AppError::NotFound(_)) => {
+            load_queued_run(&state, &headers, id).await?;
+            // It may have been started since; then it is cancelled (or not) as an execution.
+            if !storage::cancel_queued_run(&state.pool, id).await.map_err(AppError::from)? {
+                return Box::pin(cancel_execution(State(state), headers, Path(id))).await;
+            }
+            let exec = load_execution(&state, &headers, id).await?;
+            return execution_response(&state.pool, exec).await.map(Json);
+        }
+        Err(e) => return Err(e),
+    };
     if !storage::cancel_execution(&state.pool, id).await.map_err(AppError::from)? {
         return Err(AppError::Conflict(format!(
-            "execution is {}; only waiting or paused executions can be cancelled",
+            "execution is {}; only queued, waiting or paused executions can be cancelled",
             exec.status
         )));
     }
@@ -1209,4 +1230,246 @@ async fn get_browser_automation_artifact(
     let file = state.hawk.artifact(&run_id, &name).await.map_err(hawk_error)?;
     let content_type = file.content_type.unwrap_or_else(|| "application/octet-stream".into());
     Ok(([(axum::http::header::CONTENT_TYPE, content_type)], file.bytes).into_response())
+}
+
+/// A schedule as the API shows it: its spec (the same fields `PUT /schedules/:name` takes,
+/// so a listing can be written back to a config file), then its state.
+fn schedule_json(s: &storage::Schedule, upcoming: Option<usize>) -> serde_json::Value {
+    let cron = CronSchedule::parse(&s.cron, &s.timezone).ok();
+    let local = |t: Option<chrono::DateTime<Utc>>| match (t, &cron) {
+        (Some(t), Some(c)) => serde_json::json!(t.with_timezone(&c.timezone()).fixed_offset().to_rfc3339()),
+        _ => serde_json::Value::Null,
+    };
+    let mut json = serde_json::to_value(s.spec()).unwrap_or_default();
+    let extra = serde_json::json!({
+        "id": s.id,
+        "description": cron.as_ref().map(|c| c.describe()),
+        "next_run_at": s.next_run_at.map(|t| t.to_rfc3339()),
+        "next_run_local": local(s.next_run_at),
+        "last_run_at": s.last_run_at.map(|t| t.to_rfc3339()),
+        "last_scheduled_for": local(s.last_scheduled_for),
+        "last_outcome": s.last_outcome,
+        "last_error": s.last_error,
+        "last_execution_id": s.last_execution_id,
+        "active_execution_id": s.active_execution_id,
+        "created_at": s.created_at.to_rfc3339(),
+        "updated_at": s.updated_at.to_rfc3339(),
+    });
+    if let (Some(obj), serde_json::Value::Object(extra)) = (json.as_object_mut(), extra) {
+        obj.extend(extra);
+        if let Some(n) = upcoming {
+            let times = match (&cron, s.enabled) {
+                (Some(c), true) => c.upcoming(Utc::now(), n),
+                _ => Vec::new(),
+            };
+            obj.insert("upcoming".into(), serde_json::to_value(times).unwrap_or_default());
+        }
+    }
+    json
+}
+
+/// The tenant's schedule by UUID or name.
+async fn find_schedule(state: &AppState, tenant: &str, id_or_name: &str) -> Result<Option<storage::Schedule>, AppError> {
+    let found = match Uuid::parse_str(id_or_name) {
+        Ok(id) => storage::get_schedule_by_id(&state.pool, id)
+            .await
+            .map_err(AppError::from)?
+            .filter(|s| s.tenant == tenant),
+        Err(_) => None,
+    };
+    match found {
+        Some(s) => Ok(Some(s)),
+        None => storage::get_schedule_by_name(&state.pool, tenant, id_or_name)
+            .await
+            .map_err(AppError::from),
+    }
+}
+
+async fn load_schedule(state: &AppState, tenant: &str, id_or_name: &str) -> Result<storage::Schedule, AppError> {
+    find_schedule(state, tenant, id_or_name)
+        .await?
+        .ok_or_else(|| AppError::NotFound("schedule not found".into()))
+}
+
+/// Validate `spec` (including that its workflow exists) and save it, creating or replacing
+/// the schedule of that name.
+async fn save_schedule(
+    state: &AppState,
+    tenant: &str,
+    mut spec: ScheduleSpec,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let cron = spec.validate().map_err(AppError::BadRequest)?;
+    let workflow = storage::get_workflow_by_name(&state.pool, &spec.workflow, Some(tenant), spec.version)
+        .await
+        .map_err(AppError::from)?;
+    if workflow.is_none() {
+        return Err(AppError::BadRequest(match spec.version {
+            Some(v) => format!("workflow '{}' version {v} not found", spec.workflow),
+            None => format!("workflow '{}' not found", spec.workflow),
+        }));
+    }
+    let next_run_at = cron.next_after(Utc::now()).map(|o| o.at);
+    let (schedule, created) = storage::upsert_schedule(&state.pool, tenant, &spec, next_run_at)
+        .await
+        .map_err(AppError::from)?;
+    let mut json = schedule_json(&schedule, None);
+    json["created"] = serde_json::Value::Bool(created);
+    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    Ok((status, Json(json)))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SchedulesQuery {
+    /// Only schedules of this workflow (by name).
+    workflow: Option<String>,
+}
+
+async fn list_schedules(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<SchedulesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let rows = storage::list_schedules(&state.pool, &tenant, query.workflow.as_deref())
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::json!({
+        "schedules": rows.iter().map(|s| schedule_json(s, None)).collect::<Vec<_>>(),
+    })))
+}
+
+/// Create a schedule; 409 if the tenant already has one of that name (use PUT to replace).
+async fn create_schedule(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(spec): Json<ScheduleSpec>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let tenant = require_tenant(&headers)?;
+    if find_schedule(&state, &tenant, spec.name.trim()).await?.is_some() {
+        return Err(AppError::Conflict(format!("schedule '{}' already exists", spec.name.trim())));
+    }
+    save_schedule(&state, &tenant, spec).await
+}
+
+const SCHEDULE_UPCOMING: usize = 5;
+
+async fn get_schedule(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let s = load_schedule(&state, &tenant, &id).await?;
+    Ok(Json(schedule_json(&s, Some(SCHEDULE_UPCOMING))))
+}
+
+/// Create or replace a schedule by name (or replace one by id). This is what config sync
+/// calls for each schedule in a `<env>.workflow.schedules` file. The body's `name` may be left
+/// out; if given it must match. Saving an unchanged schedule does not move its next run.
+async fn put_schedule(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let tenant = require_tenant(&headers)?;
+    let name = match find_schedule(&state, &tenant, &id).await? {
+        Some(existing) => existing.name,
+        None => id.trim().to_string(),
+    };
+    let obj = body
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("body must be a JSON object".into()))?;
+    match obj.get("name").and_then(|v| v.as_str()).map(str::trim) {
+        Some(n) if n != name => {
+            return Err(AppError::BadRequest(format!(
+                "body name '{n}' does not match '{name}'; schedules cannot be renamed (create the new name and delete the old)"
+            )))
+        }
+        _ => {
+            obj.insert("name".into(), serde_json::Value::String(name));
+        }
+    }
+    let spec: ScheduleSpec = serde_json::from_value(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    save_schedule(&state, &tenant, spec).await
+}
+
+async fn delete_schedule(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let s = load_schedule(&state, &tenant, &id).await?;
+    if !storage::delete_schedule(&state.pool, &tenant, &s.name).await.map_err(AppError::from)? {
+        return Err(AppError::NotFound("schedule not found".into()));
+    }
+    Ok(Json(serde_json::json!({ "id": s.id, "name": s.name, "deleted": true })))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RunScheduleQuery {
+    /// Queue the run for a worker and return at once.
+    #[serde(rename = "async")]
+    queue: Option<bool>,
+}
+
+/// Run a schedule now, with its input, as a webhook call would (`?async=true` queues it).
+/// `Trigger.scheduled_for` is null. Its next slot, and the overlap rule, are not affected.
+async fn run_schedule(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<RunScheduleQuery>,
+) -> Result<Json<RunOutcome>, AppError> {
+    let tenant = require_tenant(&headers)?;
+    let s = load_schedule(&state, &tenant, &id).await?;
+    let workflow = storage::get_workflow_by_name(&state.pool, &s.workflow_name, Some(&tenant), s.workflow_version)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::BadRequest(format!("workflow '{}' not found", s.workflow_name)))?;
+    let persistence = s
+        .persistence
+        .as_deref()
+        .map(Persistence::parse)
+        .transpose()
+        .map_err(AppError::BadRequest)?;
+    let start = StartRun {
+        execution_id: None,
+        trigger_context: triggers::schedule_context(s.input.clone(), s.id, &s.name, None),
+        origin: RunOrigin::schedule(s.id),
+        step_mode: false,
+        persistence,
+        trace_id: workflow_engine::trace::resolve_trace_id(&headers),
+    };
+    let outcome = if query.queue == Some(true) {
+        run_queue::enqueue(&state.pool, &workflow, start, None).await?
+    } else {
+        runs::start_run(&state.pool, state.node_registry.clone(), &workflow, start).await?
+    };
+    Ok(Json(outcome))
+}
+
+#[derive(serde::Deserialize)]
+struct PreviewRequest {
+    cron: String,
+    #[serde(default)]
+    timezone: Option<String>,
+    /// How many upcoming times to return (default 5, at most 50).
+    #[serde(default)]
+    count: Option<usize>,
+}
+
+/// Check a cron expression and timezone, and show when they would fire. For editors: the
+/// times come from the same code the scheduler uses.
+async fn preview_schedule(Json(body): Json<PreviewRequest>) -> Result<Json<serde_json::Value>, AppError> {
+    let timezone = body.timezone.as_deref().unwrap_or("UTC").trim().to_string();
+    let cron = CronSchedule::parse(&body.cron, &timezone).map_err(AppError::BadRequest)?;
+    let count = body.count.unwrap_or(SCHEDULE_UPCOMING).clamp(1, 50);
+    Ok(Json(serde_json::json!({
+        "cron": body.cron.trim(),
+        "timezone": timezone,
+        "description": cron.describe(),
+        "upcoming": cron.upcoming(Utc::now(), count),
+    })))
 }

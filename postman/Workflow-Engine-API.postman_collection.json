@@ -12,7 +12,9 @@
     { "key": "template_slug", "value": "create-ticket", "type": "string", "description": "Node template slug. Set by Create/Publish Node Template." },
     { "key": "browser_automation", "value": "", "type": "string", "description": "Hawk automation id, from List Browser Automations." },
     { "key": "hawk_run_id", "value": "", "type": "string", "description": "`runId` from a BrowserAutomation node's output." },
-    { "key": "artifact_name", "value": "", "type": "string", "description": "An artifact `name` from that run." }
+    { "key": "artifact_name", "value": "", "type": "string", "description": "An artifact `name` from that run." },
+    { "key": "schedule_name", "value": "sample-weekdays-9am", "type": "string", "description": "Schedule name used by the Schedules requests." },
+    { "key": "schedule_id", "value": "", "type": "string", "description": "Set by Create/Put Schedule." }
   ],
   "item": [
     {
@@ -263,6 +265,150 @@
             },
             "url": "{{base_url}}/signals",
             "description": "Resume the tenant's runs whose Wait node (event mode) waits on `key` and whose filter accepts `payload`. Returns `{ key, resumed: [execution ids] }`; the runs continue in the background."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Schedules",
+      "item": [
+        {
+          "name": "Preview Schedule",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"cron\": \"0 9 * * 1-5\",\n  \"timezone\": \"America/New_York\",\n  \"count\": 5\n}" },
+            "url": {
+              "raw": "{{base_url}}/schedules/preview",
+              "host": ["{{base_url}}"],
+              "path": ["schedules", "preview"]
+            },
+            "description": "Check a cron expression and IANA timezone and list the next times it fires (`at` in UTC, `local` with its offset)."
+          }
+        },
+        {
+          "name": "Create Schedule",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["if (pm.response.code === 200 || pm.response.code === 201) {", "    pm.collectionVariables.set('schedule_id', pm.response.json().id);", "}"],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Required. Schedules belong to a tenant." }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{schedule_name}}\",\n  \"workflow\": \"sample\",\n  \"cron\": \"0 9 * * 1-5\",\n  \"timezone\": \"Asia/Kolkata\",\n  \"input\": {\n    \"region\": \"IN\"\n  },\n  \"enabled\": true,\n  \"overlap\": \"skip\",\n  \"catch_up\": \"once\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/schedules",
+              "host": ["{{base_url}}"],
+              "path": ["schedules"]
+            },
+            "description": "Create a schedule. 409 if the name exists (use Put Schedule to replace). The camelCase names used in config files (workflowName, catchUp) are accepted too."
+          }
+        },
+        {
+          "name": "Put Schedule (create or replace)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["if (pm.response.code === 200 || pm.response.code === 201) {", "    pm.collectionVariables.set('schedule_id', pm.response.json().id);", "}"],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Required. Schedules belong to a tenant." }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"workflow\": \"sample\",\n  \"cron\": \"0 9 * * 1-5\",\n  \"timezone\": \"Asia/Kolkata\",\n  \"input\": {\n    \"region\": \"IN\"\n  },\n  \"enabled\": true,\n  \"overlap\": \"skip\",\n  \"catch_up\": \"once\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/schedules/{{schedule_name}}",
+              "host": ["{{base_url}}"],
+              "path": ["schedules", "{{schedule_name}}"]
+            },
+            "description": "Create or replace by name, as config sync does: 201 when created, 200 when replaced. Saving an unchanged schedule does not move its next run."
+          }
+        },
+        {
+          "name": "List Schedules",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Required. Schedules belong to a tenant." }
+            ],
+            "url": {
+              "raw": "{{base_url}}/schedules?workflow=sample",
+              "host": ["{{base_url}}"],
+              "path": ["schedules"],
+              "query": [
+                { "key": "workflow", "value": "sample", "description": "Optional. Only schedules of this workflow (by name)." }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Schedule",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Required. Schedules belong to a tenant." }
+            ],
+            "url": {
+              "raw": "{{base_url}}/schedules/{{schedule_name}}",
+              "host": ["{{base_url}}"],
+              "path": ["schedules", "{{schedule_name}}"]
+            },
+            "description": "By name or id. Includes `upcoming` (the next 5 times) and the last outcome."
+          }
+        },
+        {
+          "name": "Run Schedule Now",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["const json = pm.response.json();", "if (json.execution_id) pm.collectionVariables.set('execution_id', json.execution_id);"],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Required. Schedules belong to a tenant." }
+            ],
+            "url": {
+              "raw": "{{base_url}}/schedules/{{schedule_name}}/run",
+              "host": ["{{base_url}}"],
+              "path": ["schedules", "{{schedule_name}}", "run"]
+            },
+            "description": "Run once now with the schedule's input; `?async=true` queues it. Does not move the next slot."
+          }
+        },
+        {
+          "name": "Delete Schedule",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "X-Tenant-ID", "value": "{{tenant}}", "description": "Required. Schedules belong to a tenant." }
+            ],
+            "url": {
+              "raw": "{{base_url}}/schedules/{{schedule_name}}",
+              "host": ["{{base_url}}"],
+              "path": ["schedules", "{{schedule_name}}"]
+            },
+            "description": "Its runs keep their history."
           }
         }
       ]

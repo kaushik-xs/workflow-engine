@@ -38,10 +38,18 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 | GET | /workflows/:id | Get workflow by id (includes `version`, `is_latest`) |
 | PUT | /workflows/:id | Update workflow (body: `{ "definition"?, "is_latest"? }`; set `is_latest: true` to mark as latest for that name) |
 | DELETE | /workflows/:id | Delete workflow by id. Also deletes all of the workflow's executions and their steps (cascade). Returns `{ "id", "deleted": true }`. |
-| POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name; optional `?step=true` for step-by-step (debug) mode; optional `?persist=full|errors_only|none` overrides the workflow's persistence for this call. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
-| GET | /executions/:id | Get execution (includes `workflow_version` that was run) |
+| POST | /webhook/:id | Trigger by UUID or name. Optional query `?version=1` when triggering by name; optional `?step=true` for step-by-step (debug) mode; optional `?persist=full|errors_only|none` overrides the workflow's persistence for this call; optional `?async=true` [queues the run](#queued-runs-and-workers) and returns at once with `status: "queued"` and its `execution_id`. Without version, the workflow marked latest is used. Execution records `workflow_version`. |
+| GET | /executions | List executions, newest first. Optional query: `workflow_id`, `last_minutes`, `limit` (default 100, max 500), `offset`, `trigger` (`webhook`, `schedule` or `workflow_call`), `schedule_id`. Returns `{ executions, total, limit, offset }`. |
+| GET | /executions/:id | Get execution (includes `workflow_version` that was run, and `trigger`: `webhook`, `schedule` or `workflow_call`) |
 | POST | /executions/:id/step | Run the next step for a paused execution (step-by-step mode). Returns the execution with updated status and steps. |
-| POST | /executions/:id/cancel | Cancel a `waiting` or `paused` execution so it never resumes (status `cancelled`). 409 in any other state. |
+| POST | /executions/:id/cancel | Cancel a `queued`, `waiting` or `paused` execution so it never starts or resumes (status `cancelled`). 409 in any other state. |
+| GET | /schedules | List the tenant's [schedules](#schedules); optional `?workflow=<name>`. |
+| POST | /schedules | Create a schedule (body: a [schedule](#schedules-api)). 409 if the name exists. |
+| GET | /schedules/:id | Get a schedule by id or name, with its next run, last outcome and the next 5 times it fires (`upcoming`). |
+| PUT | /schedules/:id | Create or replace a schedule by name (or replace by id). 201 when created, 200 when replaced. |
+| DELETE | /schedules/:id | Delete a schedule (by id or name). Its runs keep their history. |
+| POST | /schedules/:id/run | Run a schedule once now, with its input. Optional `?async=true` queues it. |
+| POST | /schedules/preview | Check a cron expression and timezone (body: `{ "cron", "timezone"?, "count"? }`); returns its description and the next times it fires. |
 | POST | /signals | Deliver a signal to the tenant's runs [waiting](#waiting-durable-timers-and-signals) on its key (requires **X-Tenant-ID**; body `{ "key", "payload"? }`). Returns `{ "key", "resumed": [execution ids] }`; resumed runs continue in the background. |
 | GET | /globals | List the tenant's globals (requires **X-Tenant-ID**). Returns `{ "globals": [{ "key", "value", "created_at", "updated_at" }] }`. |
 | PUT | /globals | Upsert a global (requires **X-Tenant-ID**; body `{ "key", "value" }`; `value` is any JSON). |
@@ -227,11 +235,119 @@ not wait. All values accept `{{ }}` expressions, e.g. `"timeout": "{{ item.sla }
 - **WorkflowCall**: a called workflow cannot wait; if it suspends, it is cancelled and the
   `WorkflowCall` node fails.
 
-Due timers are polled every `WAIT_POLL_INTERVAL_MS` (so a wait may run up to that much late),
+Due timers are polled by processes with the `worker` [role](#queued-runs-and-workers) every `WAIT_POLL_INTERVAL_MS` (so a wait may run up to that much late),
 and at most `WAIT_RESUME_CONCURRENCY` resumed runs execute at a time. Several replicas can poll
 the same database safely. Custom node types can suspend too: implement `NodeExecutor::run` to
 return `NodeOutcome::Suspend(SuspendSpec { wake_at, correlation_key, filter, state })`, and
 `resume` to continue from `state`.
+
+## Queued runs and workers
+
+`POST /webhook/:id?async=true` does not run the workflow in the request. It queues the run and
+returns at once:
+
+```json
+{ "execution_id": "…", "status": "queued", "result": null, "error": null }
+```
+
+A worker takes the run from the queue (`workflow_run_queue`) and runs it under that
+`execution_id`. Until then, `GET /executions/:id` shows it with status `queued` and no steps, and
+`POST /executions/:id/cancel` removes it from the queue (it is then recorded as `cancelled`).
+After it starts, it is recorded like any other run, according to its persistence mode: under the
+default `errors_only`, a successful run leaves no execution behind, so pass `?persist=full` to
+follow a queued run to its result.
+
+Each run is taken by one worker and started at most once: it leaves the queue when a worker
+claims it, so a worker that dies before the run is recorded loses that run rather than starting it
+twice. Step mode cannot be queued.
+
+**Roles.** `ENGINE_ROLES` (comma-separated) sets what a process does:
+
+| Role | Does |
+|---|---|
+| `api` | Serves the HTTP API. Synchronous webhook calls run in this process; signals resume waiting runs here. |
+| `worker` | Runs queued runs and resumes runs whose wait timer is due. Serves no HTTP. |
+| `scheduler` | Fires due [schedules](#schedules), queueing their runs for workers. Serves no HTTP. |
+
+The default, `api,worker,scheduler`, is a single process doing everything. At scale, run
+separate deployments against the same database (`ENGINE_ROLES=api`, `ENGINE_ROLES=worker`,
+`ENGINE_ROLES=scheduler`) and scale each on its own: API and workers by load, the scheduler
+usually one or two replicas (more are safe, but not faster). An environment that should not
+run its schedules (e.g. a local engine pointed at a shared database) leaves out `scheduler`. Any number of workers can share the queue: they claim runs
+with `FOR UPDATE SKIP LOCKED`, so each run is taken once. A worker keeps up to
+`RUN_WORKER_CONCURRENCY` runs going and takes the next run as soon as one finishes; it only
+waits `RUN_QUEUE_IDLE_POLL_MS` when the queue is empty. Size `DATABASE_MAX_CONNECTIONS` to the
+concurrency of the roles a process runs.
+
+## Schedules
+
+A schedule starts a workflow on a cron expression, in a timezone. Schedules belong to the
+engine (one per environment), not to the workflow definition, so the same workflow can run on
+different schedules, or none, in each environment, and still be called by webhook.
+
+- **Cron and timezone**: standard five-field cron (`minute hour day-of-month month
+  day-of-week`, plus `@daily`-style nicknames), read as wall-clock time in the schedule's IANA
+  `timezone` (default `UTC`). `0 9 * * 1-5` in `America/New_York` is 09:00 New York time all
+  year. A fixed time skipped when clocks go forward (02:30) runs at the first time after the
+  gap (03:00); one repeated when clocks go back runs once. Schedules fire at most once a minute.
+- **Input**: each run gets the schedule's `input` as `Webhook.body` (headers empty), so a
+  workflow written for webhook calls runs unchanged. `Trigger` is
+  `{ "type": "schedule", "schedule_id", "schedule_name", "scheduled_for" }`, where
+  `scheduled_for` is the slot in the schedule's timezone, e.g. `2026-10-13T09:00:00+05:30`.
+  Executions record `trigger = "schedule"` and `schedule_id`.
+- **Version**: the workflow is found by name when the schedule fires: the latest version, or a
+  fixed `version`.
+- **Firing**: the scheduler queues a run for a [worker](#queued-runs-and-workers) and moves the
+  schedule to its next slot in one transaction, so each slot fires at most once, however many
+  schedulers run.
+- **Missed slots** (due more than `SCHEDULE_MISFIRE_GRACE_SECS` ago, e.g. no scheduler was
+  running): `catch_up: "once"` (default) runs once, for the latest missed slot; `"skip"` runs
+  none and waits for the next slot.
+- **Overlap**: with `overlap: "skip"` (default), a slot is skipped while the schedule's previous
+  run is queued, waiting or paused, or started less than `SCHEDULE_RUN_LEASE_SECS` ago;
+  `"allow"` starts it anyway. Webhook calls of the same workflow never block a schedule, nor
+  the other way round.
+- **Last outcome**: each schedule records when it last came due, the slot, what happened
+  (`queued`, `skipped_overlap`, `skipped_missed` or `failed_to_start`, e.g. the workflow does
+  not exist) and the run it queued. A schedule whose cron or timezone can no longer be read
+  stops until it is saved again.
+
+### Schedules API
+
+All `/schedules` endpoints need `X-Tenant-ID` (except `preview`). A schedule is:
+
+```json
+{
+  "name": "daily-report-in",
+  "workflow": "daily-report",
+  "version": null,
+  "cron": "0 9 * * *",
+  "timezone": "Asia/Kolkata",
+  "input": { "region": "IN" },
+  "enabled": true,
+  "overlap": "skip",
+  "catch_up": "once",
+  "persist": null
+}
+```
+
+Only `name`, `workflow` and `cron` are required; the rest default as shown. `name` is unique
+per tenant (letters, digits, `-`, `_`, `.`) and cannot be changed. `persist` overrides the
+workflow's [persistence](#saving-executions-persistence) for scheduled runs. The camelCase
+names used in config files (`workflowName`, `workflowVersion`, `catchUp`, `persistence`) are
+accepted too. Saving checks the cron, the timezone and that the workflow exists.
+
+`PUT /schedules/:name` creates or replaces, which is what config sync uses: it keeps the
+schedule's next run unless the schedule is new, re-enabled, or its cron or timezone changed,
+so re-saving an unchanged schedule never moves or drops a due slot. Setting `enabled: false`
+stops it without deleting it.
+
+Responses add the schedule's state: `id`, `description` (the cron in words), `next_run_at`
+(UTC) and `next_run_local` (in its timezone), `last_run_at`, `last_scheduled_for`,
+`last_outcome`, `last_error`, `last_execution_id` and `active_execution_id`.
+
+To run the same workflow in several timezones (e.g. 09:00 local in India, the UK and the US),
+create one schedule per timezone, each with its own `input`.
 
 ## Browser automations
 
@@ -398,6 +514,7 @@ Node inputs support `{{ JMESPath }}` expressions evaluated against the execution
 The execution context exposes these roots:
 
 - `Webhook` – the trigger request (`body`, `headers`).
+- `Trigger` – how the run was started: `{ "type": "webhook" }`, or `{ "type": "workflow_call", "parent_execution_id": ... }` for a `WorkflowCall` child. Branch on it with e.g. `{{ Trigger.type == 'webhook' }}`. The same value is stored on the execution as `trigger`.
 - `nodes.<node_id>` – each completed node's output.
 - `current` – the previous node's output.
 - `global` – the tenant's stored globals (see the `/globals` API), snapshotted at execution start. Reference as `{{ global.API_BASE }}`.
@@ -476,6 +593,14 @@ Omit the header to see all tenants when listing; for create, tenant must be prov
 
 - `DATABASE_URL` – Postgres connection string (default: `postgres://localhost/workflow_engine`)
 - `PORT` – Server port (default: 3000)
+- `ENGINE_ROLES` – What this process does: `api`, `worker`, or both (default: `api,worker`). See [queued runs and workers](#queued-runs-and-workers)
+- `DATABASE_MAX_CONNECTIONS` – Postgres connection pool size (default: 5)
+- `RUN_WORKER_CONCURRENCY` – Maximum queued runs a worker process executes at once (default: 4)
+- `RUN_QUEUE_IDLE_POLL_MS` – How often an idle worker checks an empty queue (default: 500)
+- `SCHEDULER_POLL_INTERVAL_MS` – How often the scheduler looks for due [schedules](#schedules) (default: 1000)
+- `SCHEDULER_BATCH` – Schedules handled per scheduler transaction (default: 100)
+- `SCHEDULE_MISFIRE_GRACE_SECS` – How late a slot can fire before it counts as missed (default: 60)
+- `SCHEDULE_RUN_LEASE_SECS` – How long a scheduled run counts as still going for the overlap rule, unless it is waiting or paused (default: 3600)
 - `RUST_LOG` – Log level (default: `workflow_engine=info,tower_http=info`)
 - `WAIT_POLL_INTERVAL_MS` – How often due [waits](#waiting-durable-timers-and-signals) are polled (default: 1000)
 - `WAIT_RESUME_CONCURRENCY` – Maximum resumed runs executing at once (default: 4)

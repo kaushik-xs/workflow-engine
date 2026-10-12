@@ -21,6 +21,7 @@ use crate::persistence::{Persistence, Recorder};
 use crate::registry::NodeRegistry;
 use crate::storage;
 use crate::templates;
+use crate::triggers::{self, RunOrigin};
 
 /// Maximum nesting depth for WorkflowCall nodes, to guard against infinite recursion
 /// through indirect cycles (A calls B calls A ...).
@@ -159,10 +160,11 @@ impl NodeExecutor for WorkflowCallExecutor {
             self.pool.as_ref(),
             &workflow.tenant,
             &workflow.definition,
-            serde_json::json!({
-                "Webhook": { "body": body, "headers": headers },
-                "workflowCallDepth": depth
-            }),
+            {
+                let mut base = triggers::workflow_call_context(body, headers, ctx.execution_id);
+                base["workflowCallDepth"] = depth.into();
+                base
+            },
         )
         .await?;
 
@@ -189,8 +191,10 @@ impl NodeExecutor for WorkflowCallExecutor {
         let recorder = Recorder::start(
             self.pool.as_ref(),
             persistence,
+            Uuid::new_v4(),
             workflow.id,
             Some(workflow.version),
+            RunOrigin::WORKFLOW_CALL,
             &initial_context,
         )
         .await

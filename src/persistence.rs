@@ -21,6 +21,7 @@ use std::sync::Mutex;
 use uuid::Uuid;
 
 use crate::storage::{self, StepRecord, WorkflowExecution, WorkflowWait};
+use crate::triggers::RunOrigin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Persistence {
@@ -31,6 +32,14 @@ pub enum Persistence {
 }
 
 impl Persistence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ErrorsOnly => "errors_only",
+            Self::None => "none",
+        }
+    }
+
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim() {
             "full" => Ok(Self::Full),
@@ -64,6 +73,7 @@ pub struct Recorder {
     execution_id: Uuid,
     workflow_id: Uuid,
     workflow_version: Option<i32>,
+    origin: RunOrigin,
     started_at: DateTime<Utc>,
     /// Steps held back in `errors_only` and `none` mode, until the run fails or suspends.
     buffer: Mutex<Vec<StepRecord>>,
@@ -74,20 +84,23 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Start a new run. In `full` mode its execution row is created now; otherwise the
-    /// id is only reserved and nothing is written yet.
+    /// Start a new run with id `execution_id`. In `full` mode its execution row is created
+    /// now; otherwise nothing is written yet.
     pub async fn start(
         pool: &sqlx::PgPool,
         mode: Persistence,
+        execution_id: Uuid,
         workflow_id: Uuid,
         workflow_version: Option<i32>,
+        origin: RunOrigin,
         initial_context: &Value,
     ) -> Result<Self, sqlx::Error> {
-        let (execution_id, started_at) = if mode == Persistence::Full {
-            let exec = storage::create_execution(pool, workflow_id, workflow_version, initial_context, None).await?;
-            (exec.id, exec.started_at)
+        let started_at = if mode == Persistence::Full {
+            storage::create_execution(pool, execution_id, workflow_id, workflow_version, initial_context, None, origin)
+                .await?
+                .started_at
         } else {
-            (Uuid::new_v4(), Utc::now())
+            Utc::now()
         };
         Ok(Self {
             pool: pool.clone(),
@@ -95,6 +108,7 @@ impl Recorder {
             execution_id,
             workflow_id,
             workflow_version,
+            origin,
             started_at,
             buffer: Mutex::new(Vec::new()),
             pending_wait: Mutex::new(None),
@@ -110,6 +124,8 @@ impl Recorder {
             execution_id,
             workflow_id,
             workflow_version: None,
+            // Only used when this recorder writes a new row, which it never does.
+            origin: RunOrigin::WEBHOOK,
             started_at: Utc::now(),
             buffer: Mutex::new(Vec::new()),
             pending_wait: Mutex::new(None),
@@ -215,6 +231,8 @@ impl Recorder {
                     context: context.clone(),
                     started_at: self.started_at,
                     finished_at: Some(Utc::now()),
+                    trigger: self.origin.trigger.as_str().to_string(),
+                    schedule_id: self.origin.schedule_id,
                 };
                 storage::insert_finished_execution(&self.pool, &execution, &steps)
                     .await
@@ -257,6 +275,8 @@ impl Recorder {
                     context: context.clone(),
                     started_at: self.started_at,
                     finished_at: None,
+                    trigger: self.origin.trigger.as_str().to_string(),
+                    schedule_id: self.origin.schedule_id,
                 };
                 storage::suspend_execution(&self.pool, self.execution_id, context, &wait, Some((&execution, &steps)))
                     .await
