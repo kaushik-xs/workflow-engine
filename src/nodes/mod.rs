@@ -20,6 +20,7 @@ mod browser_automation;
 mod condition;
 mod http_body;
 mod http_request;
+mod http_timeout;
 mod http_trigger;
 mod if_node;
 mod merge;

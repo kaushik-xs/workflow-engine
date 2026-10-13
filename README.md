@@ -78,8 +78,8 @@ Extensible workflow execution engine with REST API. Executes user-defined workfl
 ## Node types (initial)
 
 - **HttpTrigger** – Entry point; Webhook context is set by the HTTP layer.
-- **HttpRequest** – Calls an external HTTP API (config: `method`, `url` or `path`, optional `body`/`headers`/`bodyMode`; see [HTTP request bodies](#http-request-bodies)).
-- **ServiceCall** – Calls an internal service (config: `serviceSlug`, `operation`; optional `rawBody`/`body`/`headers`/`bodyMode`, see [HTTP request bodies](#http-request-bodies)). Uses the registered service registry (stub `authrs` by default).
+- **HttpRequest** – Calls an external HTTP API (config: `method`, `url` or `path`, optional `body`/`headers`/`bodyMode`; see [HTTP request bodies](#http-request-bodies); optional `timeout`, see [Request timeouts](#request-timeouts)).
+- **ServiceCall** – Calls an internal service (config: `serviceSlug`, `operation`; optional `rawBody`/`body`/`headers`/`bodyMode`, see [HTTP request bodies](#http-request-bodies); optional `timeout`, see [Request timeouts](#request-timeouts)). Uses the registered service registry (stub `authrs` by default).
 - **WorkflowCall** – Runs another workflow as a nested execution and returns its response (config: `workflowId` or `workflow`/`workflowName` with optional `version`/`tenant`; payload via `rawBody`/`body`). Guarded against self-calls and cycles (max depth 10).
 - **SetVariable** – Writes into the workflow's `local` scope during execution (config: `variables` object, or a single `key`/`value`; values support `{{ }}`). Updated `{{ local.* }}` values are visible to downstream nodes and later steps.
 - **If** – Two-way conditional branch. Evaluates one condition and activates the `true` or `false` output port (config: `condition` as `{ left, operator, right }` or any truthy value, or top-level `left`/`operator`/`right`; optional `trueHandle`/`falseHandle` port labels).
@@ -191,6 +191,20 @@ exception is `formdata`: the engine generates the boundary, so it sets
 
 In the step output, `request.body` lists the parts sent. File parts show their `filename`,
 `contentType` and `size` in place of the content.
+
+### Request timeouts
+
+`HttpRequest` and `ServiceCall` give up on a call after `timeout`, which covers everything from
+connecting until the response body is read. It takes the same durations as `Wait`: a number of
+seconds or e.g. `"90s"`, `"5m"`, `"1h"`, and accepts `{{ }}` expressions. The default is `30s`
+and the maximum `1h`, since the run keeps its worker busy for as long as the call takes. A call
+that runs out of time fails the step with
+``HttpRequest timed out after 5m (set `timeout` to allow longer)``; an invalid `timeout` fails it before anything is sent. `HttpRequest` reports the
+timeout it used in its step output as `request.timeout`.
+
+```json
+{ "type": "httpRequest", "data": { "method": "POST", "url": "{{ global.REPORTS_URL }}/rebuild", "timeout": "5m" } }
+```
 
 ## Waiting (durable timers and signals)
 

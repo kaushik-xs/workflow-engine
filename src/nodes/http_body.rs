@@ -227,6 +227,29 @@ pub(crate) mod test_support {
         (url, handle)
     }
 
+    /// Accept one connection, read the request head, wait `delay`, then reply `{}`.
+    pub(crate) async fn slow_server(delay: std::time::Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/slow", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            tokio::time::sleep(delay).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await;
+        });
+        url
+    }
+
     pub(crate) fn header_values<'a>(head: &'a str, name: &str) -> Vec<&'a str> {
         head.lines()
             .filter_map(|l| l.split_once(':'))

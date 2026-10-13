@@ -4,10 +4,8 @@ use serde_json::Value;
 use tracing;
 
 use super::http_body::{build_form_parts, form_summary, has_header, to_reqwest_form, BodyMode};
+use super::http_timeout::{call_error, describe, request_timeout, DEFAULT_TIMEOUT_SECS};
 use crate::expression;
-
-/// Default HTTP timeout in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 pub struct HttpRequestExecutor {
     client: reqwest::Client,
@@ -47,6 +45,7 @@ impl NodeExecutor for HttpRequestExecutor {
             .or_else(|| config.get("path"))
             .and_then(Value::as_str)
             .ok_or("HttpRequest config must have url or path")?;
+        let timeout = request_timeout(&config, "HttpRequest")?;
 
         let body = input
             .get("body")
@@ -79,6 +78,7 @@ impl NodeExecutor for HttpRequestExecutor {
             "method": method,
             "url": url,
             "headers": headers,
+            "timeout": describe(timeout),
             "bodyMode": body_mode.as_str(),
             "body": match &form_parts {
                 Some(parts) => form_summary(parts),
@@ -101,7 +101,8 @@ impl NodeExecutor for HttpRequestExecutor {
             "PATCH" => self.client.patch(url),
             "DELETE" => self.client.delete(url),
             _ => self.client.get(url),
-        };
+        }
+        .timeout(timeout);
 
         // User headers go on first so body defaults below can see whether a Content-Type was
         // given (reqwest appends headers, so setting it twice would send two values). For
@@ -154,9 +155,9 @@ impl NodeExecutor for HttpRequestExecutor {
             }
         }
 
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp = req.send().await.map_err(|e| call_error(e, timeout, "HttpRequest"))?;
         let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let bytes = resp.bytes().await.map_err(|e| call_error(e, timeout, "HttpRequest"))?;
         let body_value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
             Value::String(String::from_utf8_lossy(&bytes).into_owned())
         });
@@ -274,5 +275,35 @@ mod tests {
         let config = json!({ "method": "POST", "url": "http://127.0.0.1:9/", "bodyMode": "raw", "body": { "a": 1 } });
         let err = HttpRequestExecutor::default().execute(&ctx(), "n1", Value::Null, config).await.unwrap_err();
         assert!(err.contains("requires body to be a string"));
+    }
+
+    #[tokio::test]
+    async fn a_short_timeout_fails_the_step_with_a_clear_error() {
+        let url = crate::nodes::http_body::test_support::slow_server(std::time::Duration::from_millis(500)).await;
+        let config = json!({ "method": "GET", "url": url, "timeout": "100ms" });
+        let err = HttpRequestExecutor::default().execute(&ctx(), "n1", Value::Null, config).await.unwrap_err();
+        assert_eq!(err, "HttpRequest timed out after 100ms (set `timeout` to allow longer)");
+    }
+
+    #[tokio::test]
+    async fn the_timeout_overrides_the_client_default() {
+        // A client whose own timeout is shorter than the server's delay: only the node's longer
+        // `timeout` lets the call finish.
+        let node = HttpRequestExecutor {
+            client: reqwest::Client::builder().timeout(std::time::Duration::from_millis(100)).build().unwrap(),
+        };
+        let url = crate::nodes::http_body::test_support::slow_server(std::time::Duration::from_millis(300)).await;
+        let config = json!({ "method": "GET", "url": url, "timeout": "{{ global.T }}" });
+        let ctx = ExecutionContext::new(Uuid::nil(), Uuid::nil(), json!({ "global": { "T": "2s" } }));
+        let out = node.execute(&ctx, "n1", Value::Null, config).await.unwrap();
+        assert_eq!(out["status"], 200);
+        assert_eq!(out["request"]["timeout"], "2s");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_timeout_fails_before_sending() {
+        let config = json!({ "method": "GET", "url": "http://127.0.0.1:9/never", "timeout": "soon" });
+        let err = HttpRequestExecutor::default().execute(&ctx(), "n1", Value::Null, config).await.unwrap_err();
+        assert!(err.starts_with("HttpRequest `timeout`: invalid duration"), "{err}");
     }
 }

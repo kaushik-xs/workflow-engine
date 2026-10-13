@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing;
 
 use super::http_body::{build_form_parts, form_summary, to_reqwest_form, BodyMode, FormPart};
+use super::http_timeout::{call_error, request_timeout, DEFAULT_TIMEOUT_SECS};
 use crate::expression;
 use crate::storage;
 
@@ -69,8 +70,6 @@ fn request_log(
         "body": body_for_log
     })
 }
-
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 pub struct ServiceCallExecutor {
     client: reqwest::Client,
@@ -153,6 +152,8 @@ impl NodeExecutor for ServiceCallExecutor {
                 return Err("ServiceCall bodyMode \"raw\" requires rawBody to be a string".to_string());
             }
         }
+
+        let timeout = request_timeout(&config, "ServiceCall")?;
 
         // Continue this execution's trace on the outbound call (fresh span-id per hop).
         let traceparent = ctx
@@ -261,12 +262,13 @@ impl NodeExecutor for ServiceCallExecutor {
                 "PATCH" => self.client.patch(url_val),
                 "DELETE" => self.client.delete(url_val),
                 _ => self.client.get(url_val),
-            };
+            }
+            .timeout(timeout);
             req = apply_headers_and_body(req, &config, &input, form);
 
-            let resp = req.send().await.map_err(|e| e.to_string())?;
+            let resp = req.send().await.map_err(|e| call_error(e, timeout, "ServiceCall"))?;
             let status = resp.status().as_u16();
-            let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+            let bytes = resp.bytes().await.map_err(|e| call_error(e, timeout, "ServiceCall"))?;
             let body_value = serde_json::from_slice(&bytes)
                 .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
 
@@ -343,12 +345,13 @@ impl NodeExecutor for ServiceCallExecutor {
             "PATCH" => self.client.patch(&url),
             "DELETE" => self.client.delete(&url),
             _ => self.client.get(&url),
-        };
+        }
+        .timeout(timeout);
         req = apply_headers_and_body(req, &config, &input, form);
 
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp = req.send().await.map_err(|e| call_error(e, timeout, "ServiceCall"))?;
         let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let bytes = resp.bytes().await.map_err(|e| call_error(e, timeout, "ServiceCall"))?;
         let body_value = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
 
@@ -503,5 +506,23 @@ mod tests {
         let config = json!({});
         let input = json!({ "rawBody": "[]" });
         assert_eq!(raw_body_string(&config, &input).as_deref(), Some("[]"));
+    }
+
+    #[tokio::test]
+    async fn a_short_timeout_fails_the_call_with_a_clear_error() {
+        let url = crate::nodes::http_body::test_support::slow_server(std::time::Duration::from_millis(500)).await;
+        let config = json!({ "method": "POST", "url": url, "timeout": "100ms" });
+        let ctx = ExecutionContext::new(Uuid::nil(), Uuid::nil(), json!({}));
+        let err = ServiceCallExecutor::default().execute(&ctx, "n1", Value::Null, config).await.unwrap_err();
+        assert_eq!(err, "ServiceCall timed out after 100ms (set `timeout` to allow longer)");
+    }
+
+    #[tokio::test]
+    async fn a_longer_timeout_lets_a_slow_call_finish() {
+        let url = crate::nodes::http_body::test_support::slow_server(std::time::Duration::from_millis(300)).await;
+        let config = json!({ "method": "POST", "url": url, "timeout": 5 });
+        let ctx = ExecutionContext::new(Uuid::nil(), Uuid::nil(), json!({}));
+        let out = ServiceCallExecutor::default().execute(&ctx, "n1", Value::Null, config).await.unwrap();
+        assert_eq!(out["status"], 200);
     }
 }
